@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+setup.py
+ccdtools/__init__.py
+ccdtools/__main__.py
+ccdtools/bad_pixel_mask.py
+ccdtools/cli.py
+ccdtools/file_utils.py
+ccdtools/utilities.py
+ccdtools.egg-info/PKG-INFO
+ccdtools.egg-info/SOURCES.txt
+ccdtools.egg-info/dependency_links.txt
+ccdtools.egg-info/entry_points.txt
+ccdtools.egg-info/requires.txt
+ccdtools.egg-info/top_level.txt
