@@ -1,0 +1,2 @@
+[console_scripts]
+ccdtools = ccdtools.cli:main
