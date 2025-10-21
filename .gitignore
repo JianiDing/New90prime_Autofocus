@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+.DS_Store
+.vscode/
+test_mask/
+*.fits
+*.fz
+# If you want to track large FITS files, consider using Git LFS instead

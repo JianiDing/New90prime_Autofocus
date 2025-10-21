@@ -1,0 +1,6 @@
+numpy>=1.21
+astropy
+matplotlib
+scipy
+scikit-learn
+sep
