@@ -78,7 +78,7 @@ Key focus options:
 - `--focus-threshold`, `--focus-cutout`, `--focus-max-fwhm`, `--focus-min-flux-ratio`, `--focus-max-e` tune candidate detection.
 - `--focus-sf` / `--focus-bf` control the bad-column fractions (defaults 0.25 / 0.2 to mirror the original notebook mask).
 - `--focus-sat-sigma` / `--focus-black-sigma` set the saturation/black thresholds as `median ± sigma·std` (defaults 1.0 / 4.0).
-- `--focus-write-regions --focus-region-dir ./regions` emits DS9 ellipse overlays.
+- `--focus-write-regions --focus-region-dir ./regions` output DS9 target detection ellipse.
 - `--focus-no-gui` skips the Tk window (useful on headless systems).
 - `--focus-export` writes the per-amplifier summary CSV.
 
