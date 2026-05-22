@@ -1,0 +1,51 @@
+{
+  "frame": "bs.OBJECT.0150.fits",
+  "image_number": 150,
+  "current_lvdt": {
+    "A": 1284.2189,
+    "B": 1279.336,
+    "C": 1274.4529
+  },
+  "optimal_lvdt": {
+    "A": 1285.293436292273,
+    "B": 1280.0707686734377,
+    "C": 1274.7173357802305
+  },
+  "corrections": {
+    "A": 1.0745362922729889,
+    "B": 0.7347686734376786,
+    "C": 0.26443578023048786
+  },
+  "actuator_directions": {
+    "A": {
+      "raw_delta": 1.0745362922729889,
+      "tilt_delta": 0.38328937695927034,
+      "direction": "increase LVDT",
+      "current_lvdt": 1284.2189,
+      "tilt_only_target_lvdt": 1284.6021893769594
+    },
+    "B": {
+      "raw_delta": 0.7347686734376786,
+      "tilt_delta": 0.043521758123960086,
+      "direction": "increase LVDT",
+      "current_lvdt": 1279.336,
+      "tilt_only_target_lvdt": 1279.379521758124
+    },
+    "C": {
+      "raw_delta": 0.26443578023048786,
+      "tilt_delta": -0.42681113508323065,
+      "direction": "decrease LVDT",
+      "current_lvdt": 1274.4529,
+      "tilt_only_target_lvdt": 1274.0260888649168
+    }
+  },
+  "seeing_floor_pix": 3.262013986813066,
+  "seeing_floor_arcsec": 1.484216363999945,
+  "piston_z0": -0.6912469153137184,
+  "tilt_a": -0.3832893769592704,
+  "tilt_b": -0.271546822501907,
+  "tilt_magnitude": 0.4697322889696937,
+  "R2": 0.6790227020082622,
+  "tilt_map_png": "tilt_map_150.png",
+  "fit_mode": "per_frame"
+}
