@@ -140,7 +140,7 @@
 #tilt-map-overlay {
     position: fixed;
     top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0,0,0,0.85);
+    background: rgba(255,255,255,0.94);
     z-index: 10001;
     display: none;
     justify-content: center;
@@ -156,7 +156,7 @@
     max-height: 92vh;
 }
 #tilt-map-overlay .tilt-map-pane {
-    color: #ddd;
+    color: #222;
     font-family: sans-serif;
     font-size: 12px;
     text-align: center;
@@ -166,21 +166,22 @@
     max-width: 74vw;
     max-height: 88vh;
     background: white;
-    box-shadow: 0 0 30px rgba(0,0,0,0.8);
+    box-shadow: 0 6px 28px rgba(0,0,0,0.22);
 }
 #tilt-map-overlay .amp-detail-pane {
     width: min(28vw, 380px);
     max-height: 88vh;
     overflow: auto;
-    background: rgba(24,24,24,0.96);
-    border: 1px solid rgba(255,255,255,0.22);
+    background: #fff;
+    color: #222;
+    border: 1px solid #d7dce2;
     border-radius: 8px;
     padding: 12px;
-    box-shadow: 0 0 30px rgba(0,0,0,0.55);
+    box-shadow: 0 6px 28px rgba(0,0,0,0.20);
     text-align: left;
 }
-#tilt-map-overlay .amp-detail-pane b { color: #FFB74D; }
-#tilt-map-overlay .amp-detail-pane .muted { color: #aaa; font-size: 11px; margin-top: 3px; }
+#tilt-map-overlay .amp-detail-pane b { color: #a75a00; }
+#tilt-map-overlay .amp-detail-pane .muted { color: #555; font-size: 11px; margin-top: 3px; }
 #tilt-map-overlay .amp-detail-pane table {
     width: 100%;
     border-collapse: collapse;
@@ -192,21 +193,21 @@
 #tilt-map-overlay .amp-detail-pane td {
     padding: 4px 5px;
     text-align: right;
-    border-bottom: 1px solid rgba(255,255,255,0.14);
+    border-bottom: 1px solid #e2e6ea;
 }
 #tilt-map-overlay .amp-detail-pane th:first-child,
 #tilt-map-overlay .amp-detail-pane td:first-child { text-align: left; }
-#tilt-map-overlay .amp-detail-pane .error { color: #ef5350; margin-top: 6px; }
-#tilt-map-overlay .amp-detail-pane .loading { color: #90CAF9; margin-top: 6px; }
+#tilt-map-overlay .amp-detail-pane .error { color: #b42318; margin-top: 6px; }
+#tilt-map-overlay .amp-detail-pane .loading { color: #1f5f99; margin-top: 6px; }
 #tilt-map-overlay .amp-detail-title {
     margin-bottom: 8px;
     font-weight: bold;
-    color: #eee;
+    color: #222;
 }
 #tilt-map-overlay .tilt-map-label { margin-top: 6px; }
 #tilt-map-overlay .close-hint {
     position: absolute; top: 14px; right: 18px;
-    color: #ccc; font-size: 13px; font-family: sans-serif;
+    color: #555; font-size: 13px; font-family: sans-serif;
 }
 @media (max-width: 900px) {
     #tilt-map-overlay .tilt-map-content { flex-direction: column; }
@@ -347,6 +348,25 @@
         return rowsPromise.then(buildPayload);
     }
 
+    function loadAmpFwhmFromServer(frame) {
+        return fetch('/amp_fwhm', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({frame: frame})
+        })
+        .then(function(r) {
+            var contentType = r.headers.get('content-type') || '';
+            if (contentType.indexOf('application/json') === -1) {
+                throw new Error('Live amp-FWHM service is not available');
+            }
+            return r.json().then(function(d) { return {ok: r.ok, data: d}; });
+        })
+        .then(function(result) {
+            if (!result.ok) throw new Error(result.data.error || 'Amp FWHM request failed');
+            return result.data;
+        });
+    }
+
     function showTiltAndAmpTable(frame) {
         var mapOverlay = document.getElementById('tilt-map-overlay');
         var mapImg = document.getElementById('tilt-map-img');
@@ -394,19 +414,12 @@
             var frame = pt.customdata[0];
             showTiltAndAmpTable(frame);
             if (ampPanel) ampPanel.style.display = 'none';
-            fetch('/amp_fwhm', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({frame: frame})
-            })
-            .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
-            .then(function(result) {
-                if (!result.ok) throw new Error(result.data.error || 'Amp FWHM request failed');
-                var d = result.data;
-                var html = renderAmpFwhmTable(d);
-                document.getElementById('amp-detail-content').innerHTML = html;
+            loadAmpFwhmFromServer(frame)
+            .then(function(d) {
+                document.getElementById('amp-detail-content').innerHTML = renderAmpFwhmTable(d);
             })
             .catch(function(err) {
+                if (window.console) console.warn(err.message);
                 loadAmpFwhmFromEcsv(frame)
                     .then(function(d) {
                         document.getElementById('amp-detail-content').innerHTML = renderAmpFwhmTable(d);
@@ -414,7 +427,7 @@
                     .catch(function(fallbackErr) {
                         document.getElementById('amp-detail-content').innerHTML =
                             '<b>Frame ' + frame + '</b><div class="error">' +
-                            err.message + '<br>' + fallbackErr.message + '</div>';
+                            fallbackErr.message + '</div>';
                     });
             });
         });
