@@ -7,9 +7,12 @@ focal-plane tilt from the measured FWHM pattern.
 
 The current example dashboard is here:
 
-- [Interactive focus dashboard](focus_output/focus_time_series.html)
+- [Interactive focus dashboard on GitHub Pages](https://jianiding.github.io/New90prime_Autofocus/projects/autofocus/)
 - [Static focus time series](focus_output/focus_time_series.png)
 - [Current tilt map](focus_output/tilt_map.png)
+
+If the GitHub Pages link shows `ERR_CONNECTION_RESET`, try a different network
+or phone hotspot; some networks block `github.io` even when `github.com` works.
 
 In the dashboard, hover over a point to inspect the stacked PSF contour. Click a
 point to open the tilt/focus solution with the per-amplifier FWHM detail table.
