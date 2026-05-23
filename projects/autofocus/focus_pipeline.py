@@ -2201,7 +2201,7 @@ def plot_time_series_metrics_interactive(
 
     # --- Write HTML with custom JS for PSF image overlay on hover + auto-refresh ---
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+    raw_html = fig.to_html(include_plotlyjs=True, full_html=True)
 
     # Inject auto-refresh meta tag (every 30 seconds) into <head>
     auto_refresh_meta = '<meta http-equiv="refresh" content="30">\n'
@@ -2252,38 +2252,6 @@ def plot_time_series_metrics_interactive(
 }}
 #refresh-bar .updated {{ color: #4CAF50; }}
 #refresh-bar .countdown {{ color: #FFB74D; }}
-#fit-controls {{
-    position: fixed;
-    top: 12px;
-    left: 12px;
-    background: rgba(34,34,34,0.93);
-    color: #eee;
-    border-radius: 8px;
-    padding: 10px 14px;
-    z-index: 9998;
-    font-size: 13px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    max-width: 270px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.45);
-    cursor: move;
-    user-select: none;
-}}
-#fit-selected-btn {{
-    background: #4CAF50;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    padding: 7px 14px;
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: bold;
-}}
-#fit-selected-btn:hover {{ background: #45a049; }}
-#fit-selected-btn:disabled {{ background: #555; cursor: not-allowed; }}
-#fit-selected-count {{ color: #FFB74D; font-size: 12px; }}
-#fit-status {{ color: #90CAF9; font-size: 12px; word-break: break-word; }}
 #amp-fwhm-panel {{
     position: fixed;
     bottom: 36px;
@@ -2438,14 +2406,6 @@ def plot_time_series_metrics_interactive(
     <span>Last updated: <span class="updated">{generated_time}</span></span>
     <span>Auto-refresh in <span class="countdown" id="countdown">60</span>s</span>
 </div>
-<div id="fit-controls">
-    <div><b>Focus Fit</b></div>
-    <div style="font-size:11px;color:#aaa">Use the box/lasso tool to select points, then click:</div>
-    <button id="fit-selected-btn">Fit Selected</button>
-    <button id="reset-view-btn" style="background:#555;color:white;border:none;border-radius:4px;padding:5px 14px;cursor:pointer;font-size:12px;">Reset View</button>
-    <div id="fit-selected-count"></div>
-    <div id="fit-status"></div>
-</div>
 <div id="amp-fwhm-panel">
     <button id="amp-fwhm-close">x</button>
     <div id="amp-fwhm-content"></div>
@@ -2454,7 +2414,6 @@ def plot_time_series_metrics_interactive(
 (function() {{
     var overlay = document.getElementById('psf-overlay');
     var psfImg  = document.getElementById('psf-img');
-    var selectedFrameNums = [];
     var psfThumbs = null;
     var ampPanel = document.getElementById('amp-fwhm-panel');
     var ampContent = document.getElementById('amp-fwhm-content');
@@ -2554,25 +2513,6 @@ def plot_time_series_metrics_interactive(
         return rowsPromise.then(buildPayload);
     }}
 
-    function loadAmpFwhmFromServer(frame) {{
-        return fetch('/amp_fwhm', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{frame: frame}})
-        }})
-        .then(function(r) {{
-            var contentType = r.headers.get('content-type') || '';
-            if (contentType.indexOf('application/json') === -1) {{
-                throw new Error('Live amp-FWHM service is not available');
-            }}
-            return r.json().then(function(d) {{ return {{ok: r.ok, data: d}}; }});
-        }})
-        .then(function(result) {{
-            if (!result.ok) throw new Error(result.data.error || 'Amp FWHM request failed');
-            return result.data;
-        }});
-    }}
-
     function showTiltAndAmpTable(frame) {{
         var mapOverlay = document.getElementById('tilt-map-overlay');
         var mapImg = document.getElementById('tilt-map-img');
@@ -2620,114 +2560,17 @@ def plot_time_series_metrics_interactive(
             var frame = pt.customdata[0];
             showTiltAndAmpTable(frame);
             if (ampPanel) ampPanel.style.display = 'none';
-            loadAmpFwhmFromServer(frame)
+            loadAmpFwhmFromEcsv(frame)
             .then(function(d) {{
                 document.getElementById('amp-detail-content').innerHTML = renderAmpFwhmTable(d);
             }})
-            .catch(function(err) {{
-                if (window.console) console.warn(err.message);
-                loadAmpFwhmFromEcsv(frame)
-                    .then(function(d) {{
-                        document.getElementById('amp-detail-content').innerHTML = renderAmpFwhmTable(d);
-                    }})
-                    .catch(function(fallbackErr) {{
-                        document.getElementById('amp-detail-content').innerHTML =
-                            '<b>Frame ' + frame + '</b><div class="error">' +
-                            fallbackErr.message + '</div>';
-                    }});
+            .catch(function(fallbackErr) {{
+                document.getElementById('amp-detail-content').innerHTML =
+                    '<b>Frame ' + frame + '</b><div class="error">' +
+                    fallbackErr.message + '</div>';
             }});
         }});
 
-        // --- Frame selection for focus fit ---
-        function loadTiltForFrame(frame, openMap) {{ /* deprecated: kept as no-op */ }}
-
-        gd.on('plotly_selected', function(eventData) {{
-            var countEl = document.getElementById('fit-selected-count');
-            if (!eventData || !eventData.points) {{
-                selectedFrameNums = [];
-                countEl.textContent = '';
-                return;
-            }}
-            var nums = eventData.points
-                .filter(function(pt) {{ return pt.customdata && pt.customdata[0] != null; }})
-                .map(function(pt) {{ return pt.customdata[0]; }});
-            // deduplicate
-            selectedFrameNums = nums.filter(function(v, i, a) {{ return a.indexOf(v) === i; }});
-            countEl.textContent = selectedFrameNums.length + ' frame(s) selected';
-        }});
-        gd.on('plotly_deselect', function() {{
-            selectedFrameNums = [];
-            document.getElementById('fit-selected-count').textContent = '';
-            document.getElementById('fit-status').textContent = '';
-        }});
-    }}
-
-    // --- Draggable fit-controls panel ---
-    (function() {{
-        var panel = document.getElementById('fit-controls');
-        var drag = {{ active: false, startX: 0, startY: 0, origLeft: 0, origTop: 0 }};
-        panel.addEventListener('mousedown', function(e) {{
-            if (e.target.tagName === 'BUTTON') return;
-            drag.active = true;
-            drag.startX = e.clientX;
-            drag.startY = e.clientY;
-            drag.origLeft = panel.offsetLeft;
-            drag.origTop  = panel.offsetTop;
-            e.preventDefault();
-        }});
-        document.addEventListener('mousemove', function(e) {{
-            if (!drag.active) return;
-            panel.style.left = (drag.origLeft + e.clientX - drag.startX) + 'px';
-            panel.style.top  = (drag.origTop  + e.clientY - drag.startY) + 'px';
-        }});
-        document.addEventListener('mouseup', function() {{ drag.active = false; }});
-    }})();
-
-    // --- Reset View button ---
-    document.getElementById('reset-view-btn').onclick = function() {{
-        if (gd) {{
-            Plotly.relayout(gd, {{
-                'xaxis.autorange': true, 'yaxis.autorange': true,
-                'xaxis2.autorange': true, 'yaxis2.autorange': true,
-                'xaxis3.autorange': true, 'yaxis3.autorange': true,
-            }});
-        }}
-    }};
-
-    // --- Fit Selected button ---
-    document.getElementById('fit-selected-btn').onclick = function() {{
-        if (selectedFrameNums.length < 3) {{
-            alert('Please select at least 3 data points for a valid parabola fit.');
-            return;
-        }}
-        var btn      = document.getElementById('fit-selected-btn');
-        var statusEl = document.getElementById('fit-status');
-        btn.disabled = true;
-        statusEl.textContent = 'Running fit\u2026';
-        fetch('/fit_selected', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{frames: selectedFrameNums}})
-        }})
-        .then(function(r) {{ return r.json(); }})
-        .then(function(data) {{
-            btn.disabled = false;
-            if (data.error) {{
-                statusEl.textContent = 'Error: ' + data.error;
-            }} else if (data.best_focus !== undefined) {{
-                // Fast path: result available immediately, no page reload needed
-                statusEl.innerHTML = '\u2713 Best focus: <strong>' + data.best_focus +
-                    '</strong> &nbsp;R\u00b2=' + data.r2 +
-                    ' &nbsp;<a href="/focus_fit.png" target="_blank" style="color:#4af">view plot</a>';
-            }} else {{
-                statusEl.textContent = 'Fit done! Refreshing\u2026';
-                setTimeout(function() {{ location.reload(); }}, 3000);
-            }}
-        }})
-        .catch(function(e) {{
-            btn.disabled = false;
-            statusEl.textContent = 'Request failed: ' + e.message;
-        }});
     }};
 
     // --- Countdown timer ---

@@ -72,6 +72,10 @@ python serve.py 8080
 
 Then open `http://localhost:8080/focus_time_series.html`.
 
+On GitHub Pages the dashboard is static: hover thumbnails, click-through tilt
+maps, and per-amplifier tables work from the committed output files. Live
+server actions are intentionally omitted from the shared dashboard.
+
 You can mix single numbers and ranges (e.g. `--sci-nums 90 93-96 101`). Ranges may be ascending or descending.
 
 Add `--auto-generate-masks` to let the script build 2-D bad-pixel maps from the master flats on the fly (saved beneath `--mask-dir`). Tweak the thresholds with `--mask-sat-mult`, `--mask-black-mult`, `--mask-sat-frac`, and `--mask-black-frac` if you need stricter or looser masking. Use `--skip-reduced` to explicitly suppress writing reduced FITS products even if `--write-reduced` appears elsewhere in your workflow.
