@@ -239,6 +239,7 @@ def plot_per_amp_fits(
     average_best_focus: float,
     average_best_focus_error: float,
     n_good_amps: int,
+    show_fit_errors: bool = True,
 ) -> None:
     amps = [int(a) for a in fits["amp"]]
     n_cols = 4
@@ -263,7 +264,11 @@ def plot_per_amp_fits(
             h_sigma = float(fit_row["best_focus_sigma"])
             ax.plot(xx, A * (xx - h) ** 2 + k, color="tab:green", lw=1.5)
             ax.axvline(h, color="tab:green", ls="--", alpha=0.6)
-            sigma_text = f" +/- {h_sigma:.2f}" if np.isfinite(h_sigma) else ""
+            sigma_text = (
+                f" +/- {h_sigma:.2f}"
+                if show_fit_errors and np.isfinite(h_sigma)
+                else ""
+            )
             ax.set_title(f"Amp {amp}: {h:.2f}{sigma_text}")
         else:
             ax.set_title(f"Amp {amp}: no fit")
@@ -275,7 +280,7 @@ def plot_per_amp_fits(
         ax.axis("off")
 
     if np.isfinite(average_best_focus):
-        if np.isfinite(average_best_focus_error):
+        if show_fit_errors and np.isfinite(average_best_focus_error):
             title = (
                 f"Per-amplifier best focus; average = "
                 f"{average_best_focus:.2f} +/- {average_best_focus_error:.2f} "
@@ -313,6 +318,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--points-name", default="focus_per_amp_points.ecsv")
     parser.add_argument("--summary-name", default="focus_per_amp_best_focus.ecsv")
     parser.add_argument("--plot-name", default="focus_per_amp_best_focus.png")
+    parser.add_argument(
+        "--hide-fit-errors",
+        action="store_true",
+        help="Hide best-focus uncertainty text in the plot while using the same fit data.",
+    )
     return parser.parse_args()
 
 
@@ -355,6 +365,7 @@ def main() -> None:
         average_best_focus=avg_best_focus,
         average_best_focus_error=avg_best_focus_error,
         n_good_amps=n_good_amps,
+        show_fit_errors=not args.hide_fit_errors,
     )
 
     print(f"Wrote per-amp FWHM points: {points_path}")
