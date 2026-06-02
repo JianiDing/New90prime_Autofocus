@@ -41,7 +41,8 @@ def build_pipeline_command(args: argparse.Namespace, sci_numbers: Sequence[int])
     base_cmd += ["--bias-nums", *args.bias_nums]
     if args.dark_nums:
         base_cmd += ["--dark-nums", *args.dark_nums]
-    base_cmd += ["--flat-nums", *args.flat_nums]
+    if args.flat_nums:
+        base_cmd += ["--flat-nums", *args.flat_nums]
     base_cmd += ["--sci-nums", *(str(num) for num in sci_numbers)]
     base_cmd += ["--mask-dir", str(Path(args.mask_dir).resolve())]
     base_cmd += ["--outdir", str(Path(args.outdir).resolve())]
@@ -107,6 +108,9 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
             if len(frames) < 3:
                 self._json(400, {"error": "Need at least 3 frames for a parabola fit"})
                 return
+            Path(outdir_str, "selected_frames.txt").write_text(
+                " ".join(str(x) for x in frames)
+            )
             # Fast path: fit directly from existing ECSV — no pipeline re-run needed
             ecsv_path = Path(outdir_str) / "focus_time_series.ecsv"
             if ecsv_path.exists():
@@ -116,9 +120,6 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
                 except Exception as exc:
                     print(f"[server] Fast fit failed ({exc}), falling back to pipeline")
             # Fallback: run full pipeline
-            Path(outdir_str, "selected_frames.txt").write_text(
-                " ".join(str(x) for x in frames)
-            )
             all_nums = sorted(shared.get("image_numbers", set()) or set(frames))
             cmd = [c for c in build_pipeline_command(args, all_nums) if c != "--no-fit"]
             cmd += ["--fit-nums"] + [str(f) for f in frames]
@@ -523,8 +524,16 @@ def parse_args() -> argparse.Namespace:
                              "comma-separated list (e.g. R,G,I), or 'all' to "
                              "show every band in one dashboard (default: all)")
     parser.add_argument("--bias-nums", nargs="+", required=True, help="Bias image numbers")
-    parser.add_argument("--dark-nums", nargs="*", default=[], help="Dark image numbers (optional; omit if no darks)")
-    parser.add_argument("--flat-nums", nargs="+", required=True, help="Flat image numbers")
+    parser.add_argument("--dark-nums", nargs="*", default=None, help="Dark image numbers (optional; omit if no darks)")
+    parser.add_argument(
+        "--flat-nums",
+        nargs="+",
+        default=None,
+        help=(
+            "Flat image numbers. If omitted in multi-band/all mode, "
+            "focus_pipeline.py auto-discovers flats by band."
+        ),
+    )
     parser.add_argument("--mask-dir", default="bad_pixel_masks", help="Bad mask directory")
     parser.add_argument("--outdir", default="focus_output", help="Output directory for products")
     parser.add_argument("--focus-key", default="LVDTC", help="Focus header keyword")

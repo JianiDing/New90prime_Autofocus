@@ -1147,19 +1147,41 @@ def _get_cache_dir(outdir: Path) -> Path:
     return d
 
 
+def _file_fingerprint(path: str) -> Dict[str, object]:
+    """Return a compact signature for cache invalidation."""
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return {"path": str(p.resolve()), "missing": True}
+    return {
+        "path": str(p.resolve()),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
 def _validate_cache_params(
-    cache_dir: Path, threshold: float, amps: List[int],
+    cache_dir: Path,
+    threshold: float,
+    amps: List[int],
+    cache_inputs: Optional[Dict] = None,
 ) -> None:
-    """Wipe stale per-file caches when detection parameters change."""
+    """Wipe stale caches when detection or calibration inputs change."""
     meta_path = cache_dir / "_params.json"
-    current = json.dumps({"threshold": threshold, "amps": sorted(amps)}, sort_keys=True)
+    payload = {"threshold": threshold, "amps": sorted(amps)}
+    if cache_inputs:
+        payload.update(cache_inputs)
+    current = json.dumps(payload, sort_keys=True)
     if meta_path.exists():
         if meta_path.read_text().strip() == current:
             return
-        print("[incremental] Detection parameters changed \u2014 clearing cached detections")
+        print("[incremental] Inputs changed - clearing cached detections and calibrations")
         for p in cache_dir.glob("*_cat.fits"):
             p.unlink()
         for p in cache_dir.glob("*_cutouts.npz"):
+            p.unlink()
+        for p in cache_dir.glob("master_*.npy"):
             p.unlink()
     meta_path.write_text(current)
 
@@ -2203,10 +2225,6 @@ def plot_time_series_metrics_interactive(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     raw_html = fig.to_html(include_plotlyjs=True, full_html=True)
 
-    # Inject auto-refresh meta tag (every 30 seconds) into <head>
-    auto_refresh_meta = '<meta http-equiv="refresh" content="30">\n'
-    raw_html = raw_html.replace("<head>", "<head>\n" + auto_refresh_meta)
-
     # Inject a floating overlay div + JS for PSF hover + a live-update status bar
     from datetime import datetime as _dt
     generated_time = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -2292,6 +2310,59 @@ def plot_time_series_metrics_interactive(
 #amp-fwhm-panel th:first-child,
 #amp-fwhm-panel td:first-child {{ text-align: left; }}
 #amp-fwhm-panel .muted {{ color: #aaa; font-size: 11px; }}
+#fit-selected-panel {{
+    position: fixed;
+    bottom: 36px;
+    left: 12px;
+    background: rgba(34,34,34,0.94);
+    color: #eee;
+    border-radius: 8px;
+    padding: 10px 12px;
+    z-index: 9998;
+    font-size: 12px;
+    min-width: 260px;
+    max-width: 440px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.45);
+}}
+#fit-selected-panel b {{ color: #FFB74D; }}
+#fit-selected-panel .muted {{
+    color: #aaa;
+    font-size: 11px;
+    margin-top: 3px;
+    line-height: 1.35;
+}}
+#fit-selected-panel .result {{
+    margin-top: 7px;
+    font-family: monospace;
+    white-space: pre-wrap;
+}}
+#fit-selected-panel .error {{ color: #ff8a80; }}
+#fit-selected-panel img {{
+    display: none;
+    width: 100%;
+    max-height: 280px;
+    object-fit: contain;
+    background: white;
+    border-radius: 4px;
+    margin-top: 8px;
+}}
+#fit-selected-panel button {{
+    margin-top: 8px;
+    margin-right: 6px;
+    background: #2f6fed;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 5px 9px;
+}}
+#fit-selected-panel button.secondary {{ background: #555; }}
+#fit-selected-panel button:disabled {{
+    background: #555;
+    color: #aaa;
+    cursor: not-allowed;
+}}
 #tilt-panel {{
     position: fixed;
     bottom: 36px;
@@ -2404,7 +2475,15 @@ def plot_time_series_metrics_interactive(
 </div>
 <div id="refresh-bar">
     <span>Last updated: <span class="updated">{generated_time}</span></span>
-    <span>Auto-refresh in <span class="countdown" id="countdown">60</span>s</span>
+    <span>Auto-refresh: <span class="countdown" id="countdown">30</span></span>
+</div>
+<div id="fit-selected-panel">
+    <b>Selected Fit</b>
+    <div class="muted" id="fit-selected-status">Box/lasso select at least 3 FWHM points.</div>
+    <div class="result" id="fit-selected-result"></div>
+    <img id="fit-selected-plot" src="" alt="Selected focus fit">
+    <button id="fit-selected-button" disabled>Fit Selected</button>
+    <button id="fit-selected-clear" class="secondary" disabled>Clear</button>
 </div>
 <div id="amp-fwhm-panel">
     <button id="amp-fwhm-close">x</button>
@@ -2418,6 +2497,13 @@ def plot_time_series_metrics_interactive(
     var ampPanel = document.getElementById('amp-fwhm-panel');
     var ampContent = document.getElementById('amp-fwhm-content');
     var ampClose = document.getElementById('amp-fwhm-close');
+    var fitButton = document.getElementById('fit-selected-button');
+    var fitClear = document.getElementById('fit-selected-clear');
+    var fitStatus = document.getElementById('fit-selected-status');
+    var fitResult = document.getElementById('fit-selected-result');
+    var fitPlot = document.getElementById('fit-selected-plot');
+    var selectedFrames = [];
+    var isFittingSelected = false;
     if (ampClose) ampClose.onclick = function() {{ ampPanel.style.display = 'none'; }};
     fetch('psf_thumbnails.json')
         .then(function(r) {{ return r.json(); }})
@@ -2513,6 +2599,25 @@ def plot_time_series_metrics_interactive(
         return rowsPromise.then(buildPayload);
     }}
 
+    function loadAmpFwhm(frame) {{
+        return fetch('/amp_fwhm', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{frame: Number(frame)}})
+        }})
+        .then(function(r) {{
+            return r.json().then(function(payload) {{
+                if (!r.ok) throw new Error(payload.error || ('HTTP ' + r.status));
+                return payload;
+            }});
+        }})
+        .catch(function(serverErr) {{
+            return loadAmpFwhmFromEcsv(frame).catch(function(fileErr) {{
+                throw new Error(serverErr.message + '; ' + fileErr.message);
+            }});
+        }});
+    }}
+
     function showTiltAndAmpTable(frame) {{
         var mapOverlay = document.getElementById('tilt-map-overlay');
         var mapImg = document.getElementById('tilt-map-img');
@@ -2532,6 +2637,87 @@ def plot_time_series_metrics_interactive(
         }}
         mapOverlay.style.display = 'flex';
     }}
+
+    function frameFromPoint(pt) {{
+        if (pt && pt.customdata && pt.customdata[0] != null) return Number(pt.customdata[0]);
+        return null;
+    }}
+
+    function updateSelectedFrames(points) {{
+        var seen = {{}};
+        selectedFrames = [];
+        (points || []).forEach(function(pt) {{
+            var frame = frameFromPoint(pt);
+            if (frame == null || !Number.isFinite(frame) || seen[frame]) return;
+            seen[frame] = true;
+            selectedFrames.push(frame);
+        }});
+        selectedFrames.sort(function(a, b) {{ return a - b; }});
+        if (fitStatus) {{
+            if (selectedFrames.length) {{
+                fitStatus.textContent = selectedFrames.length + ' frame(s): ' + selectedFrames.join(', ');
+            }} else {{
+                fitStatus.textContent = 'Box/lasso select at least 3 FWHM points.';
+            }}
+        }}
+        if (fitButton) fitButton.disabled = selectedFrames.length < 3;
+        if (fitClear) fitClear.disabled = selectedFrames.length === 0;
+        if (fitResult && selectedFrames.length === 0) fitResult.textContent = '';
+        if (fitPlot && selectedFrames.length === 0) fitPlot.style.display = 'none';
+    }}
+
+    function fitSelectedFrames() {{
+        if (!selectedFrames.length || selectedFrames.length < 3) return;
+        isFittingSelected = true;
+        if (fitButton) fitButton.disabled = true;
+        if (fitResult) {{
+            fitResult.className = 'result';
+            fitResult.textContent = 'Fitting selected frames...';
+        }}
+        fetch('/fit_selected', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{frames: selectedFrames}})
+        }})
+        .then(function(r) {{
+            return r.json().then(function(payload) {{
+                if (!r.ok) throw new Error(payload.error || ('HTTP ' + r.status));
+                return payload;
+            }});
+        }})
+        .then(function(payload) {{
+            var lines = [];
+            if (payload.best_focus != null) lines.push('Best focus: ' + payload.best_focus);
+            if (payload.r2 != null) lines.push('R^2: ' + payload.r2);
+            lines.push('Updated focus_fit.png');
+            if (fitResult) {{
+                fitResult.className = 'result';
+                fitResult.textContent = lines.join('\\n');
+            }}
+            if (fitPlot) {{
+                fitPlot.src = 'focus_fit.png?t=' + Date.now();
+                fitPlot.style.display = 'block';
+            }}
+        }})
+        .catch(function(err) {{
+            if (fitResult) {{
+                fitResult.className = 'result error';
+                fitResult.textContent = err.message;
+            }}
+        }})
+        .finally(function() {{
+            isFittingSelected = false;
+            if (fitButton) fitButton.disabled = selectedFrames.length < 3;
+        }});
+    }}
+
+    if (fitButton) fitButton.onclick = fitSelectedFrames;
+    if (fitClear) fitClear.onclick = function() {{
+        updateSelectedFrames([]);
+        if (gd && Plotly) {{
+            try {{ Plotly.restyle(gd, {{selectedpoints: null}}); }} catch (err) {{}}
+        }}
+    }};
 
     var gd = document.querySelector('.plotly-graph-div') ||
              document.querySelector('[class*="plotly"]');
@@ -2560,7 +2746,7 @@ def plot_time_series_metrics_interactive(
             var frame = pt.customdata[0];
             showTiltAndAmpTable(frame);
             if (ampPanel) ampPanel.style.display = 'none';
-            loadAmpFwhmFromEcsv(frame)
+            loadAmpFwhm(frame)
             .then(function(d) {{
                 document.getElementById('amp-detail-content').innerHTML = renderAmpFwhmTable(d);
             }})
@@ -2571,15 +2757,31 @@ def plot_time_series_metrics_interactive(
             }});
         }});
 
+        gd.on('plotly_selected', function(data) {{
+            updateSelectedFrames(data ? data.points : []);
+        }});
+
+        gd.on('plotly_deselect', function() {{
+            updateSelectedFrames([]);
+        }});
+
     }};
 
     // --- Countdown timer ---
-    var remaining = 60;
+    var refreshSeconds = 30;
+    var remaining = refreshSeconds;
     var el = document.getElementById('countdown');
     setInterval(function() {{
+        if (selectedFrames.length > 0 || isFittingSelected) {{
+            if (el) el.textContent = 'paused';
+            return;
+        }}
         remaining--;
-        if (remaining < 0) remaining = 0;
-        el.textContent = remaining;
+        if (remaining <= 0) {{
+            window.location.reload();
+            return;
+        }}
+        if (el) el.textContent = remaining;
     }}, 1000);
 }})();
 </script>
@@ -2772,6 +2974,7 @@ def main():
 
     # Determine which bands actually have science frames + flats
     active_bands: List[str] = []
+    requested_flat_numbers = expand_image_numbers(args.flat_nums) if args.flat_nums else None
     for band in requested_bands:
         sci_pool = categorized[band]["other"]
         flat_pool = categorized[band]["flat"]
@@ -2780,14 +2983,15 @@ def main():
         if not sci_found:
             continue
         if not flat_pool:
-            # If explicit --flat-nums was given, check if those exist; else warn
-            if args.flat_nums:
-                flat_found = select_files_by_numbers(flat_pool, expand_image_numbers(args.flat_nums))
-                if not flat_found:
-                    print(f"  [warn] No flats found for band {band}; skipping this band")
-                    continue
-            else:
-                print(f"  [warn] No flats found for band {band}; skipping this band")
+            print(f"  [warn] No flats found for band {band}; skipping this band")
+            continue
+        if requested_flat_numbers is not None:
+            flat_found = select_files_by_numbers(flat_pool, requested_flat_numbers)
+            if not flat_found:
+                print(
+                    f"  [warn] Requested --flat-nums do not include any "
+                    f"{band.lower()}-band flats; skipping this band"
+                )
                 continue
         active_bands.append(band)
 
@@ -2818,6 +3022,39 @@ def main():
         print(f"  {band.lower()}-band: {n} frames")
 
     cache_dir = _get_cache_dir(outdir)
+    bias_files_for_cache = select_files_by_numbers(categorized["bias_frames"], bias_numbers)
+    dark_files_for_cache = select_files_by_numbers(categorized["dark_frames"], dark_numbers)
+    flat_files_for_cache: Dict[str, List[str]] = {}
+    for band in active_bands:
+        flat_pool = categorized[band]["flat"]
+        if requested_flat_numbers is not None:
+            flat_files_for_cache[band] = select_files_by_numbers(flat_pool, requested_flat_numbers)
+        else:
+            flat_files_for_cache[band] = sorted(flat_pool)
+    mask_files_for_cache = [
+        str(mask_dir / f"bad_pixel_mask_amp_{band}{amp}.npy")
+        for band in active_bands
+        for amp in args.amps
+    ]
+    cache_inputs = {
+        "data_dir": str(data_dir.resolve()),
+        "mask_dir": str(mask_dir.resolve()),
+        "active_bands": active_bands,
+        "auto_generate_masks": bool(args.auto_generate_masks),
+        "mask_saturation": {
+            "sat_mult": args.mask_sat_mult,
+            "black_mult": args.mask_black_mult,
+            "sat_frac": args.mask_sat_frac,
+            "black_frac": args.mask_black_frac,
+        },
+        "bias_files": [_file_fingerprint(p) for p in bias_files_for_cache],
+        "dark_files": [_file_fingerprint(p) for p in dark_files_for_cache],
+        "flat_files_by_band": {
+            band: [_file_fingerprint(p) for p in files]
+            for band, files in flat_files_for_cache.items()
+        },
+        "mask_files": [_file_fingerprint(p) for p in mask_files_for_cache],
+    }
 
     # ------------------------------------------------------------------
     # Master calibrations: one bias (shared), one flat per band per amp
@@ -2827,7 +3064,7 @@ def main():
     masters_from_cache = False
 
     if args.incremental:
-        _validate_cache_params(cache_dir, args.threshold, list(args.amps))
+        _validate_cache_params(cache_dir, args.threshold, list(args.amps), cache_inputs)
         loaded_all = True
         for band in active_bands:
             master_cache_per_band[band] = {}
@@ -2848,16 +3085,22 @@ def main():
             master_cache_per_band = {}  # reset partial load
 
     if not masters_from_cache:
-        bias_files = select_files_by_numbers(categorized["bias_frames"], bias_numbers)
-        dark_files = select_files_by_numbers(categorized["dark_frames"], dark_numbers)
+        bias_files = bias_files_for_cache
+        dark_files = dark_files_for_cache
 
         for band in active_bands:
             # Select flats for this band
             flat_pool = categorized[band]["flat"]
             if args.flat_nums:
-                flat_files = select_files_by_numbers(flat_pool, expand_image_numbers(args.flat_nums))
+                flat_files = select_files_by_numbers(flat_pool, requested_flat_numbers)
             else:
                 flat_files = sorted(flat_pool)  # auto: use all available flats
+            if not flat_files:
+                raise RuntimeError(
+                    f"No {band.lower()}-band flats selected. "
+                    "Omit --flat-nums for automatic per-band flats, or include "
+                    "flat numbers for every science band."
+                )
             print(f"\nBuilding master calibrations for {band.lower()}-band "
                   f"({len(flat_files)} flats) ...")
 
