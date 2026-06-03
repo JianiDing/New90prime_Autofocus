@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import http.server
 import json
+import os
 import re
+import signal
 import socketserver
 import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional, Sequence, Set
 
@@ -24,6 +29,10 @@ except ImportError as exc:  # pragma: no cover - user guidance path
     ) from exc
 
 IMAGE_REGEX = re.compile(r"(\d+)")
+PIPELINE_BUSY_MESSAGE = (
+    "Pipeline is already running for this dashboard. Wait for it to finish "
+    "before starting another fit/tilt request."
+)
 
 
 def extract_image_number(filename: str) -> Optional[int]:
@@ -35,7 +44,10 @@ def extract_image_number(filename: str) -> Optional[int]:
 
 
 def build_pipeline_command(args: argparse.Namespace, sci_numbers: Sequence[int]) -> List[str]:
-    base_cmd: List[str] = [args.python_bin, str(Path(args.pipeline_script).resolve())]
+    base_cmd: List[str] = []
+    if getattr(args, "pipeline_nice", 0):
+        base_cmd += ["nice", "-n", str(args.pipeline_nice)]
+    base_cmd += [args.python_bin, str(Path(args.pipeline_script).resolve())]
     base_cmd += ["--data-dir", str(Path(args.data_dir).resolve())]
     base_cmd += ["--filter", args.filter]
     base_cmd += ["--bias-nums", *args.bias_nums]
@@ -52,6 +64,8 @@ def build_pipeline_command(args: argparse.Namespace, sci_numbers: Sequence[int])
     base_cmd += ["--pixscale", str(args.pixscale)]
     base_cmd += ["--airmass-key", args.airmass_key]
     base_cmd += ["--threshold", str(args.threshold)]
+    base_cmd += ["--fwhm-method", args.fwhm_method]
+    base_cmd += ["--gmm-fwhm-method", args.gmm_fwhm_method]
     if args.amps:
         base_cmd += ["--amps", *(str(amp) for amp in args.amps)]
     if args.auto_generate_masks:
@@ -75,6 +89,105 @@ def build_pipeline_command(args: argparse.Namespace, sci_numbers: Sequence[int])
     return base_cmd
 
 
+@contextmanager
+def outdir_pipeline_lock(outdir: str):
+    """Non-blocking lockfile so two monitor processes cannot share one outdir."""
+    lock_path = Path(outdir) / ".pipeline.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise RuntimeError(
+                    f"Another pipeline process is already using {lock_path.parent}"
+                ) from exc
+            raise
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{time.time():.3f}\n")
+            handle.flush()
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def monitor_pipeline_slot(shared: dict):
+    """Non-blocking in-process lock shared by watcher and HTTP handlers."""
+    lock = shared.setdefault("pipeline_lock", threading.Lock())
+    acquired = lock.acquire(blocking=False)
+    if not acquired:
+        raise RuntimeError(PIPELINE_BUSY_MESSAGE)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def pipeline_is_busy(shared: dict) -> bool:
+    lock = shared.setdefault("pipeline_lock", threading.Lock())
+    return lock.locked()
+
+
+def run_pipeline_subprocess(
+    cmd: List[str],
+    shared: dict,
+    *,
+    capture_output: bool = False,
+    timeout: Optional[float] = None,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run one child pipeline and remember it so shutdown can terminate it."""
+    stdout = subprocess.PIPE if capture_output else None
+    stderr = subprocess.PIPE if capture_output else None
+    proc = subprocess.Popen(
+        cmd,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        start_new_session=True,
+    )
+    shared["active_process"] = proc
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        terminate_active_process(shared, reason="timeout")
+        out, err = proc.communicate()
+        raise
+    finally:
+        if shared.get("active_process") is proc:
+            shared["active_process"] = None
+
+    result = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout, stderr=result.stderr
+        )
+    return result
+
+
+def terminate_active_process(shared: dict, reason: str = "shutdown") -> None:
+    proc = shared.get("active_process")
+    if proc is None or proc.poll() is not None:
+        return
+    print(f"[monitor] Terminating active pipeline process ({reason})")
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print("[monitor] Active pipeline did not stop; killing it")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        proc.wait(timeout=10)
+
+
 def make_http_handler(args: argparse.Namespace, shared: dict):
     """Return a combined request handler: serves static files from outdir + POST /fit_selected."""
     outdir_str = str(Path(args.outdir).resolve())
@@ -82,6 +195,13 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
     class _Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=outdir_str, **kw)
+
+        def do_GET(self):  # type: ignore[override]
+            if self.path in {"/favicon.ico", "favicon.ico"}:
+                self.send_response(204)
+                self.end_headers()
+                return
+            super().do_GET()
 
         def do_POST(self):  # type: ignore[override]
             if self.path == "/fit_selected":
@@ -108,6 +228,9 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
             if len(frames) < 3:
                 self._json(400, {"error": "Need at least 3 frames for a parabola fit"})
                 return
+            if pipeline_is_busy(shared):
+                self._json(409, {"error": PIPELINE_BUSY_MESSAGE})
+                return
             Path(outdir_str, "selected_frames.txt").write_text(
                 " ".join(str(x) for x in frames)
             )
@@ -125,7 +248,13 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
             cmd += ["--fit-nums"] + [str(f) for f in frames]
             print(f"[server] Running pipeline fit for {len(frames)} selected frames: {frames}")
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                with monitor_pipeline_slot(shared), outdir_pipeline_lock(outdir_str):
+                    result = run_pipeline_subprocess(
+                        cmd,
+                        shared,
+                        capture_output=True,
+                        timeout=600,
+                    )
                 if result.returncode != 0:
                     err = (result.stderr or result.stdout or "")[-800:]
                     print(f"[server] Fit failed:\n{err}")
@@ -139,6 +268,8 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
                     if per_amp:
                         payload["per_amp"] = per_amp
                     self._json(200, payload)
+            except RuntimeError as exc:
+                self._json(409, {"error": str(exc)})
             except subprocess.TimeoutExpired:
                 self._json(500, {"error": "Pipeline timed out (600 s)"})
 
@@ -263,9 +394,9 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
                 fits.meta["n_good_amps"] = n_good
                 fits.meta["fit_numbers"] = list(frames)
 
-                points_path = Path(outdir_str) / "focus_per_amp_points.ecsv"
-                summary_path = Path(outdir_str) / "focus_per_amp_best_focus.ecsv"
-                plot_path = Path(outdir_str) / "focus_per_amp_best_focus.png"
+                points_path = Path(outdir_str) / "selected_focus_per_amp_points.ecsv"
+                summary_path = Path(outdir_str) / "selected_focus_per_amp_best_focus.ecsv"
+                plot_path = Path(outdir_str) / "selected_focus_per_amp_best_focus.png"
                 points.write(points_path, format="ascii.ecsv", overwrite=True)
                 fits.write(summary_path, format="ascii.ecsv", overwrite=True)
                 _plot_per_amp_fits(
@@ -389,6 +520,9 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
             if not ecsv_path.exists():
                 self._json(404, {"error": "focus_time_series.ecsv not found"})
                 return
+            if pipeline_is_busy(shared):
+                self._json(409, {"error": PIPELINE_BUSY_MESSAGE})
+                return
             try:
                 payload = self._amp_fwhm_for_frame(ecsv_path, frame)
                 self._json(200, payload)
@@ -412,6 +546,9 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
             except Exception as exc:
                 self._json(400, {"error": f"Bad request: {exc}"})
                 return
+            if pipeline_is_busy(shared):
+                self._json(409, {"error": PIPELINE_BUSY_MESSAGE})
+                return
             all_nums = sorted(shared.get("image_numbers", set()) or {frame})
             if frame not in all_nums:
                 all_nums = sorted(set(all_nums) | {frame})
@@ -419,7 +556,13 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
             cmd += ["--solve-tilt", "--solve-tilt-frame", str(frame), "--no-fit"]
             print(f"[server] Solving tilt for frame {frame} ...")
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                with monitor_pipeline_slot(shared), outdir_pipeline_lock(outdir_str):
+                    result = run_pipeline_subprocess(
+                        cmd,
+                        shared,
+                        capture_output=True,
+                        timeout=600,
+                    )
                 if result.returncode != 0:
                     err = (result.stderr or result.stdout or "")[-800:]
                     print(f"[server] Tilt solve failed:\n{err}")
@@ -427,6 +570,8 @@ def make_http_handler(args: argparse.Namespace, shared: dict):
                     return
                 print(f"[server] Tilt solve complete for frame {frame}")
                 self._json(200, {"status": "ok", "frame": frame})
+            except RuntimeError as exc:
+                self._json(409, {"error": str(exc)})
             except subprocess.TimeoutExpired:
                 self._json(500, {"error": "Pipeline timed out (600 s)"})
 
@@ -457,17 +602,57 @@ def collect_existing_numbers(args: argparse.Namespace) -> Set[int]:
     return numbers
 
 
+def collect_previous_output_numbers(outdir: str) -> Set[int]:
+    """Read frame numbers from an existing dashboard time series, if present."""
+    path = Path(outdir) / "focus_time_series.ecsv"
+    if not path.exists():
+        return set()
+    try:
+        from astropy.table import Table as _Table
+
+        table = _Table.read(str(path), format="ascii.ecsv")
+        if "sci_file" in table.colnames:
+            numbers = set()
+            for value in table["sci_file"]:
+                num = extract_image_number(str(value))
+                if num is not None:
+                    numbers.add(num)
+            return numbers
+    except Exception:
+        pass
+
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return set()
+    numbers: Set[int] = set()
+    fits_re = re.compile(r"([A-Za-z0-9_.-]*?(\d+)\.fits?)")
+    for match in fits_re.finditer(text):
+        try:
+            numbers.add(int(match.group(2)))
+        except ValueError:
+            continue
+    return numbers
+
+
 class ScienceWatcher(FileSystemEventHandler):
     def __init__(
         self,
         args: argparse.Namespace,
-        initial_numbers: Set[int],
+        seen_numbers: Set[int],
+        initial_pipeline_numbers: Set[int],
+        shared: dict,
     ) -> None:
         super().__init__()
         self.args = args
-        self.image_numbers: Set[int] = set(initial_numbers)
+        self.shared = shared
+        self.seen_numbers: Set[int] = set(seen_numbers)
+        self.image_numbers: Set[int] = set(initial_pipeline_numbers)
         self.lock = threading.Lock()
         self.timer: Optional[threading.Timer] = None
+        self.pipeline_running = False
+        self.rerun_requested = False
+        self.running_numbers: Set[int] = set()
 
     def on_created(self, event):  # type: ignore[override]
         if getattr(event, "is_directory", False):
@@ -486,8 +671,9 @@ class ScienceWatcher(FileSystemEventHandler):
         if num is None:
             return
         with self.lock:
-            if num in self.image_numbers:
+            if num in self.seen_numbers:
                 return
+            self.seen_numbers.add(num)
             self.image_numbers.add(num)
         print(f"[monitor] Detected new science file {path.name} (#{num})")
         self._schedule_run()
@@ -501,17 +687,46 @@ class ScienceWatcher(FileSystemEventHandler):
 
     def _run_pipeline(self) -> None:
         with self.lock:
+            if self.pipeline_running:
+                self.rerun_requested = True
+                print("[monitor] Pipeline already running; queued one follow-up run")
+                return
+            self.pipeline_running = True
             numbers = sorted(self.image_numbers)
+            self.running_numbers = set(numbers)
         if not numbers:
+            with self.lock:
+                self.pipeline_running = False
+                self.running_numbers = set()
             return
         time.sleep(self.args.settle_seconds)
         cmd = build_pipeline_command(self.args, numbers)
         print(f"[monitor] Running pipeline for {len(numbers)} science frames...")
         try:
-            subprocess.run(cmd, check=True)
+            with monitor_pipeline_slot(self.shared), outdir_pipeline_lock(self.args.outdir):
+                run_pipeline_subprocess(cmd, self.shared, check=True)
             print("[monitor] Pipeline run complete")
+        except RuntimeError as exc:
+            print(f"[monitor] Pipeline skipped: {exc}")
         except subprocess.CalledProcessError as exc:
             print(f"[monitor] Pipeline failed with code {exc.returncode}")
+        finally:
+            with self.lock:
+                pending_numbers = set(self.image_numbers) - self.running_numbers
+                self.pipeline_running = False
+                rerun = self.rerun_requested
+                self.rerun_requested = False
+                self.running_numbers = set()
+            if rerun:
+                if pending_numbers:
+                    print(
+                        f"[monitor] Starting queued follow-up run "
+                        f"({len(pending_numbers)} new frame(s): "
+                        f"{sorted(pending_numbers)[:10]})"
+                    )
+                    self._schedule_run()
+                else:
+                    print("[monitor] Queued follow-up skipped; no new frames pending")
 
 
 def parse_args() -> argparse.Namespace:
@@ -547,6 +762,34 @@ def parse_args() -> argparse.Namespace:
         help="Plate scale in arcsec/pixel (default: 0.455 for Bok 90Prime)",
     )
     parser.add_argument("--threshold", type=float, default=25.0, help="SEP threshold")
+    parser.add_argument(
+        "--fwhm-method",
+        choices=("direct", "moffat", "gaussian"),
+        default="direct",
+        help=(
+            "Per-star FWHM method passed to focus_pipeline.py. 'direct' is "
+            "the default half-maximum crossing; 'moffat' fits a Moffat "
+            "profile; 'gaussian' uses the previous Gaussian radial fit."
+        ),
+    )
+    parser.add_argument(
+        "--gmm-fwhm-method",
+        choices=("same", "direct", "moffat", "gaussian"),
+        default="same",
+        help=(
+            "FWHM feature passed to the GMM star selector. 'same' reuses "
+            "--fwhm-method; use 'gaussian' with '--fwhm-method direct' for "
+            "Gaussian selection plus direct reported seeing."
+        ),
+    )
+    parser.add_argument(
+        "--allow-slow-moffat",
+        action="store_true",
+        help=(
+            "Allow realtime monitor runs that use Moffat FWHM fitting. This can "
+            "be extremely slow for full-frame/all-band reductions."
+        ),
+    )
     parser.add_argument("--amps", nargs="+", type=int, default=None, help="Amplifier list")
     parser.add_argument(
         "--mask-sat-mult",
@@ -608,6 +851,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to focus_pipeline.py",
     )
     parser.add_argument(
+        "--pipeline-nice",
+        type=int,
+        default=5,
+        help=(
+            "Run child pipeline jobs through nice with this priority increment "
+            "(default: 5). Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--python-bin",
         default=sys.executable,
         help="Python interpreter used to run the pipeline",
@@ -654,6 +906,32 @@ def parse_args() -> argparse.Namespace:
         help="Disable incremental mode; reprocess everything each run",
     )
     parser.add_argument(
+        "--no-initial-run",
+        action="store_true",
+        help=(
+            "Deprecated alias for the default behavior: serve/watch without "
+            "processing files that already existed when the monitor started."
+        ),
+    )
+    parser.add_argument(
+        "--initial-run",
+        action="store_true",
+        help=(
+            "Immediately process all existing matching science files, then watch "
+            "for new ones. Use this only when you intentionally want to reduce "
+            "the current backlog."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume-output",
+        action="store_true",
+        help=(
+            "Do not seed the next pipeline run from an existing "
+            "focus_time_series.ecsv in --outdir. By default, the monitor resumes "
+            "the previous dashboard frames and appends new exposures."
+        ),
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=8000,
@@ -668,6 +946,14 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
         raise SystemExit(f"Data directory {data_dir} does not exist")
+    if (
+        (args.fwhm_method == "moffat" or args.gmm_fwhm_method == "moffat")
+        and not args.allow_slow_moffat
+    ):
+        raise SystemExit(
+            "Refusing realtime Moffat mode because it can overload the server. "
+            "Use --allow-slow-moffat only for small subsets or intentional tests."
+        )
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -700,20 +986,42 @@ def main() -> None:
     else:
         print("[monitor] No science files found yet; waiting for first exposure")
 
-    handler = ScienceWatcher(args, existing_numbers)
+    previous_output_numbers = (
+        set() if args.no_resume_output else collect_previous_output_numbers(args.outdir)
+    )
+    if previous_output_numbers:
+        print(
+            f"[monitor] Resuming dashboard with {len(previous_output_numbers)} "
+            "previous output frame(s)"
+        )
+
+    initial_pipeline_numbers = (
+        set(existing_numbers)
+        if args.initial_run
+        else set(previous_output_numbers)
+    )
+    handler = ScienceWatcher(args, existing_numbers, initial_pipeline_numbers, shared)
     shared["image_numbers"] = handler.image_numbers  # live reference, updated by watcher
     observer = Observer()
     observer.schedule(handler, str(data_dir), recursive=False)
     observer.start()
 
     try:
-        if existing_numbers:
+        if existing_numbers and args.initial_run and not args.no_initial_run:
             handler._schedule_run()
+        elif existing_numbers:
+            print(
+                "[monitor] Existing files will be ignored for processing; "
+                "new files will be processed as they arrive. Previous dashboard "
+                "frames are kept if found in --outdir. Use --initial-run to "
+                "reduce the existing backlog."
+            )
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("[monitor] Shutting down")
     finally:
+        terminate_active_process(shared)
         observer.stop()
         observer.join()
 
