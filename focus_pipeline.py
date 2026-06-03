@@ -134,7 +134,7 @@ def skim_fits_files(
 
 def select_files_by_numbers(file_list: Iterable[str], numbers: Iterable[int],
                             strict: bool = False) -> List[str]:
-    """Pick files whose stem contains any of the requested image numbers.
+    """Pick files whose final numeric stem group equals a requested image number.
 
     Parameters
     ----------
@@ -143,11 +143,18 @@ def select_files_by_numbers(file_list: Iterable[str], numbers: Iterable[int],
         If False (default), print a warning and skip missing numbers.
     """
 
+    import re as _re
+
+    def _image_number(path: str) -> Optional[int]:
+        matches = _re.findall(r"(\d+)", Path(path).stem)
+        if not matches:
+            return None
+        return int(matches[-1])
+
     selected: List[str] = []
     missing: List[int] = []
     for num in numbers:
-        tokens = {str(num), f"{num:04d}", f"{num:05d}"}
-        matches = [f for f in file_list if any(tok in Path(f).stem for tok in tokens)]
+        matches = [f for f in file_list if _image_number(f) == int(num)]
         if not matches:
             if strict:
                 raise ValueError(f"No file found for image number {num} within provided list.")
@@ -342,9 +349,16 @@ def data_reduction(
             plt.close()
 
         if write_output:
+            if outdir is None:
+                raise ValueError("write_output=True requires an explicit outdir")
+            outdir_path = Path(outdir)
+            sci_dir = Path(sci_path).resolve().parent
+            if outdir_path.resolve() == sci_dir:
+                raise ValueError(
+                    "Refusing to write reduced products into the raw science directory"
+                )
             base = Path(sci_path).with_suffix("").name
             outname = f"{base}_amp{ext}_reduced.fits"
-            outdir_path = Path(outdir) if outdir else Path(sci_path).parent
             outdir_path.mkdir(parents=True, exist_ok=True)
             outpath = outdir_path / outname
             fits.writeto(outpath, final, hdr, overwrite=True)
@@ -413,11 +427,79 @@ def gaussian(r, a, mu, sigma, c):
     return a * np.exp(-((r - mu) ** 2) / (2 * sigma ** 2)) + c
 
 
+def moffat_profile(r, a, alpha, beta, c):
+    return c + a * (1.0 + (r / alpha) ** 2) ** (-beta)
+
+
+def direct_halfmax_fwhm(r: np.ndarray, flux: np.ndarray) -> float:
+    """Measure FWHM from the first radial half-maximum crossing."""
+    if r.size < 6 or flux.size < 6:
+        return np.nan
+    baseline = np.median(flux[-5:]) if flux.size >= 5 else np.median(flux)
+    peak = np.nanmax(flux)
+    if not np.isfinite(peak) or not np.isfinite(baseline) or peak <= baseline:
+        return np.nan
+    half = baseline + 0.5 * (peak - baseline)
+    imax = int(np.nanargmax(flux))
+    for i in range(imax + 1, len(flux)):
+        if flux[i] <= half:
+            r1, r2 = float(r[i - 1]), float(r[i])
+            y1, y2 = float(flux[i - 1]), float(flux[i])
+            if y2 == y1:
+                rh = r2
+            else:
+                rh = r1 + (half - y1) * (r2 - r1) / (y2 - y1)
+            return float(2.0 * rh) if np.isfinite(rh) and rh > 0 else np.nan
+    return np.nan
+
+
+def fit_gaussian_fwhm(r: np.ndarray, flux: np.ndarray) -> float:
+    baseline = np.median(flux[-5:]) if flux.size >= 5 else np.median(flux)
+    amp0 = max(float(np.nanmax(flux) - baseline), 0.0)
+    popt, _ = curve_fit(
+        gaussian,
+        r,
+        flux,
+        p0=[amp0, 0.0, 2.0, baseline],
+        maxfev=5000,
+    )
+    return float(2.355 * abs(popt[2]))
+
+
+def fit_moffat_fwhm(r: np.ndarray, flux: np.ndarray) -> float:
+    baseline = np.median(flux[-5:]) if flux.size >= 5 else np.median(flux)
+    amp0 = max(float(np.nanmax(flux) - baseline), 1e-3)
+    popt, _ = curve_fit(
+        moffat_profile,
+        r,
+        flux,
+        p0=[amp0, 2.0, 3.0, baseline],
+        bounds=([0.0, 0.2, 1.01, -np.inf], [np.inf, 20.0, 50.0, np.inf]),
+        maxfev=5000,
+    )
+    _, alpha, beta, _ = popt
+    if not np.isfinite(alpha) or not np.isfinite(beta) or beta <= 1.0:
+        return np.nan
+    return float(2.0 * alpha * np.sqrt(2.0 ** (1.0 / beta) - 1.0))
+
+
+def measure_radial_fwhm(r: np.ndarray, flux: np.ndarray, method: str) -> float:
+    if method == "direct":
+        return direct_halfmax_fwhm(r, flux)
+    if method == "gaussian":
+        return fit_gaussian_fwhm(r, flux)
+    if method == "moffat":
+        return fit_moffat_fwhm(r, flux)
+    raise ValueError(f"Unknown FWHM method: {method}")
+
+
 def sep_run_2(
     mask_data: np.ndarray,
     threshold: float,
     cutout_size: int = 15,
     minarea: int = 20,
+    fwhm_method: str = "direct",
+    gmm_fwhm_method: str = "same",
     verbose: bool = False,
 ):
     """Run SEP extraction and compute radial FWHM per detection."""
@@ -438,7 +520,7 @@ def sep_run_2(
         if verbose:
             print("No objects returned by sep.extract")
         empty = np.array([])
-        return data_sub, None, empty, empty, empty, empty, empty, []
+        return data_sub, None, empty, empty, empty, empty, empty, empty, []
 
     if verbose:
         print("Number of objects detected:", len(objects))
@@ -450,6 +532,7 @@ def sep_run_2(
 
     nobj = len(objects)
     fwhm_radial = np.full(nobj, np.nan, dtype=float)
+    fwhm_select = np.full(nobj, np.nan, dtype=float)
     flux_in_fwhm = np.full(nobj, np.nan, dtype=float)
     flux_peak_ratio = np.full(nobj, np.nan, dtype=float)
     # Store peak-normalized cutouts for objects with valid FWHM fits
@@ -482,21 +565,17 @@ def sep_run_2(
         rp_flux_fit = rp_flux[mask_valid]
 
         try:
-            baseline = np.median(rp_flux_fit[-5:]) if rp_flux_fit.size >= 5 else np.median(rp_flux_fit)
-            amp0 = max(rp_flux_fit.max() - baseline, 0.0)
-            popt, _ = curve_fit(
-                gaussian,
-                rp_r_fit,
-                rp_flux_fit,
-                p0=[amp0, 0.0, 2.0, baseline],
-                maxfev=5000,
-            )
-            sigma = abs(popt[2])
-            fwhm = 2.355 * sigma
+            fwhm = measure_radial_fwhm(rp_r_fit, rp_flux_fit, fwhm_method)
             fwhm_radial[idx] = fwhm
+            if gmm_fwhm_method == "same":
+                fwhm_select[idx] = fwhm
+            else:
+                fwhm_select[idx] = measure_radial_fwhm(
+                    rp_r_fit, rp_flux_fit, gmm_fwhm_method
+                )
         except Exception as exc:
             if verbose:
-                print(f"Gaussian fit failed for obj {idx}: {exc}")
+                print(f"{fwhm_method} FWHM measurement failed for obj {idx}: {exc}")
             continue
 
         yy, xx = np.indices(cutout.shape)
@@ -517,7 +596,17 @@ def sep_run_2(
             np.nan,
         ).astype(float)
 
-    return data_sub, objects, fwhm_sep, fwhm_radial, flux_in_fwhm, flux_peak_ratio, e, cutouts
+    return (
+        data_sub,
+        objects,
+        fwhm_sep,
+        fwhm_radial,
+        fwhm_select,
+        flux_in_fwhm,
+        flux_peak_ratio,
+        e,
+        cutouts,
+    )
 
 
 def _to_str_array(col) -> np.ndarray:
@@ -541,7 +630,8 @@ def _parse_file_idx_array(sid_all: np.ndarray) -> np.ndarray:
 
 
 def compute_gmm_labels(tbl_cutt: Table) -> np.ndarray:
-    fwhm_vals = np.array(tbl_cutt["FWHM"])
+    gmm_fwhm_col = "FWHM_select" if "FWHM_select" in tbl_cutt.colnames else "FWHM"
+    fwhm_vals = np.array(tbl_cutt[gmm_fwhm_col])
     flux_ratio_vals = np.array(tbl_cutt["flux_ratio"])
     flux_vals = np.array(tbl_cutt["flux"])
     mag_vals = -2.5 * np.log10(np.clip(flux_vals, 1e-12, None))
@@ -1167,7 +1257,13 @@ def _validate_cache_params(
     amps: List[int],
     cache_inputs: Optional[Dict] = None,
 ) -> None:
-    """Wipe stale caches when detection or calibration inputs change."""
+    """Wipe stale per-file detections when detection inputs change.
+
+    Master calibration files are kept.  In realtime mode the active science
+    band set can grow as new exposures arrive, and masks may be generated
+    during a run; neither case should force rebuilding all master flats/biases
+    on the next exposure.
+    """
     meta_path = cache_dir / "_params.json"
     payload = {"threshold": threshold, "amps": sorted(amps)}
     if cache_inputs:
@@ -1176,13 +1272,7 @@ def _validate_cache_params(
     if meta_path.exists():
         if meta_path.read_text().strip() == current:
             return
-        print("[incremental] Inputs changed - clearing cached detections and calibrations")
-        for p in cache_dir.glob("*_cat.fits"):
-            p.unlink()
-        for p in cache_dir.glob("*_cutouts.npz"):
-            p.unlink()
-        for p in cache_dir.glob("master_*.npy"):
-            p.unlink()
+        print("[incremental] Inputs changed - validating per-file detection caches")
     meta_path.write_text(current)
 
 
@@ -1222,15 +1312,41 @@ def _file_cache_stem(sci_path: str) -> str:
     return Path(sci_path).stem
 
 
+def _detection_cache_meta(
+    sci_path: str,
+    band: str,
+    threshold: float,
+    amps: List[int],
+    fwhm_method: str,
+    gmm_fwhm_method: str,
+    mask_dir: Path,
+) -> Dict[str, object]:
+    return {
+        "science": _file_fingerprint(sci_path),
+        "band": band,
+        "threshold": float(threshold),
+        "amps": sorted(int(a) for a in amps),
+        "fwhm_method": fwhm_method,
+        "gmm_fwhm_method": gmm_fwhm_method,
+        "mask_files": [
+            _file_fingerprint(str(mask_dir / f"bad_pixel_mask_amp_{band}{amp}.npy"))
+            for amp in amps
+        ],
+    }
+
+
 def _save_file_detections(
     cache_dir: Path,
     sci_path: str,
     tab: Table,
     cutouts: List[Optional[np.ndarray]],
+    meta: Optional[Dict[str, object]] = None,
 ) -> None:
     """Write per-file detection table and cutouts to the cache directory."""
     stem = _file_cache_stem(sci_path)
     tab.write(cache_dir / f"{stem}_cat.fits", overwrite=True)
+    if meta is not None:
+        (cache_dir / f"{stem}_meta.json").write_text(json.dumps(meta, sort_keys=True))
     valid = np.array([c is not None for c in cutouts], dtype=bool)
     if valid.any():
         ref = next(c for c in cutouts if c is not None)
@@ -1249,7 +1365,9 @@ def _save_file_detections(
 
 
 def _load_file_detections(
-    cache_dir: Path, sci_path: str,
+    cache_dir: Path,
+    sci_path: str,
+    expected_meta: Optional[Dict[str, object]] = None,
 ) -> Optional[Tuple[Table, List[Optional[np.ndarray]]]]:
     """Load cached detections.  Returns *None* on cache miss."""
     stem = _file_cache_stem(sci_path)
@@ -1257,6 +1375,16 @@ def _load_file_detections(
     cut_p = cache_dir / f"{stem}_cutouts.npz"
     if not (cat_p.exists() and cut_p.exists()):
         return None
+    if expected_meta is not None:
+        meta_p = cache_dir / f"{stem}_meta.json"
+        if not meta_p.exists():
+            return None
+        try:
+            cached_meta = json.loads(meta_p.read_text())
+        except Exception:
+            return None
+        if cached_meta != expected_meta:
+            return None
     tab = Table.read(cat_p)
     if "_cache_amp" not in tab.colnames:
         return None  # incompatible old cache; reprocess
@@ -1282,10 +1410,13 @@ def _detect_single_file(
     threshold: float,
     outdir: Path,
     write_reduced: bool,
+    fwhm_method: str,
+    gmm_fwhm_method: str,
 ) -> Tuple[Optional[Table], List[Optional[np.ndarray]]]:
     """Run SEP detection on one science file across all requested amps."""
     all_tables: List[Table] = []
     all_fwhm: List[np.ndarray] = []
+    all_fwhm_select: List[np.ndarray] = []
     all_e: List[np.ndarray] = []
     all_flux_ratio: List[np.ndarray] = []
     all_cutouts: List[List[Optional[np.ndarray]]] = []
@@ -1305,8 +1436,21 @@ def _detect_single_file(
             mask = load_bad_mask(mask_dir, filter_band, amp, reduced.shape)
             masked_d = mask_bad_columns(reduced, mask)
 
-            data_sub, objects, _, fwhm_radial, _, flux_peak_ratio, e, cutouts = sep_run_2(
-                masked_d, threshold,
+            (
+                data_sub,
+                objects,
+                _,
+                fwhm_radial,
+                fwhm_select,
+                _,
+                flux_peak_ratio,
+                e,
+                cutouts,
+            ) = sep_run_2(
+                masked_d,
+                threshold,
+                fwhm_method=fwhm_method,
+                gmm_fwhm_method=gmm_fwhm_method,
             )
             if objects is None or len(objects) == 0:
                 continue
@@ -1314,6 +1458,7 @@ def _detect_single_file(
             tab = Table(objects)
             all_tables.append(tab)
             all_fwhm.append(np.array(fwhm_radial))
+            all_fwhm_select.append(np.array(fwhm_select))
             all_e.append(np.array(e))
             all_flux_ratio.append(np.array(flux_peak_ratio))
             all_cutouts.append(cutouts)
@@ -1329,6 +1474,7 @@ def _detect_single_file(
     stacked = vstack(all_tables, join_type="exact")
     stacked["subset_id"] = np.concatenate(subset_labels)
     stacked["FWHM"] = np.concatenate(all_fwhm)
+    stacked["FWHM_select"] = np.concatenate(all_fwhm_select)
     stacked["e"] = np.concatenate(all_e)
     stacked["flux_ratio"] = np.concatenate(all_flux_ratio)
     stacked["_cache_amp"] = np.concatenate(amp_nums)
@@ -1350,6 +1496,8 @@ def run_detection_loop_incremental(
     outdir: Path,
     write_reduced: bool,
     cache_dir: Path,
+    fwhm_method: str,
+    gmm_fwhm_method: str,
 ) -> Tuple[Table, List[str], List[Optional[np.ndarray]]]:
     """Incremental version of *run_detection_loop*.
 
@@ -1381,6 +1529,8 @@ def run_detection_loop_incremental(
         tab, cutouts = _detect_single_file(
             sci_path, file_idx, amps, master_cache,
             filter_band, mask_dir, threshold, outdir, write_reduced,
+            fwhm_method,
+            gmm_fwhm_method,
         )
         if tab is not None:
             _save_file_detections(cache_dir, sci_path, tab, cutouts)
@@ -1412,9 +1562,12 @@ def run_detection_loop(
     threshold: float,
     outdir: Path,
     write_reduced: bool,
+    fwhm_method: str = "direct",
+    gmm_fwhm_method: str = "same",
 ) -> Tuple[Table, List[str]]:
     all_tables: List[Table] = []
     all_fwhm: List[np.ndarray] = []
+    all_fwhm_select: List[np.ndarray] = []
     all_e: List[np.ndarray] = []
     all_flux_ratio: List[np.ndarray] = []
     all_cutouts: List[List[Optional[np.ndarray]]] = []
@@ -1440,9 +1593,21 @@ def run_detection_loop(
                 mask = load_bad_mask(mask_dir, filter_band, amp, image_data.shape)
                 masked_d = mask_bad_columns(image_data, mask)
 
-                data_sub, objects, _, fwhm_radial, _, flux_peak_ratio, e, cutouts = sep_run_2(
+                (
+                    data_sub,
+                    objects,
+                    _,
+                    fwhm_radial,
+                    fwhm_select,
+                    _,
+                    flux_peak_ratio,
+                    e,
+                    cutouts,
+                ) = sep_run_2(
                     masked_d,
                     threshold,
+                    fwhm_method=fwhm_method,
+                    gmm_fwhm_method=gmm_fwhm_method,
                 )
 
                 if objects is None or len(objects) == 0:
@@ -1451,6 +1616,7 @@ def run_detection_loop(
                 tab = Table(objects)
                 all_tables.append(tab)
                 all_fwhm.append(np.array(fwhm_radial))
+                all_fwhm_select.append(np.array(fwhm_select))
                 all_e.append(np.array(e))
                 all_flux_ratio.append(np.array(flux_peak_ratio))
                 all_cutouts.append(cutouts)
@@ -1465,6 +1631,7 @@ def run_detection_loop(
     stacked = vstack(all_tables, join_type="exact")
     labels_flat = np.concatenate(subset_labels)
     fwhm_flat = np.concatenate(all_fwhm)
+    fwhm_select_flat = np.concatenate(all_fwhm_select)
     e_flat = np.concatenate(all_e)
     flux_ratio_flat = np.concatenate(all_flux_ratio)
     cutouts_flat: List[Optional[np.ndarray]] = []
@@ -1473,6 +1640,7 @@ def run_detection_loop(
 
     stacked["subset_id"] = labels_flat
     stacked["FWHM"] = fwhm_flat
+    stacked["FWHM_select"] = fwhm_select_flat
     stacked["e"] = e_flat
     stacked["flux_ratio"] = flux_ratio_flat
 
@@ -2095,6 +2263,7 @@ def plot_time_series_metrics_interactive(
         unique_bands = sorted(set(filters_col))
     else:
         unique_bands = [""]
+    has_filter_colors = filters_col is not None
     multiband = filters_col is not None and len(unique_bands) > 1
 
     # Convert FWHM to arcsec if plate scale is available
@@ -2171,7 +2340,7 @@ def plot_time_series_metrics_interactive(
             idx_sel = np.where(mask)[0]
             utc_sel = Time(mjd[mask], format="mjd", scale="utc").to_datetime()
             hover_sel = [_hover_text(i) for i in idx_sel]
-            color = band_plotly_colors.get(band, default_color) if multiband else default_color
+            color = band_plotly_colors.get(band, default_color) if has_filter_colors else default_color
             trace_name = f"{name_prefix} ({band.lower()})" if multiband else name_prefix
 
             kwargs = dict(
@@ -2207,7 +2376,10 @@ def plot_time_series_metrics_interactive(
         _add_band_traces(2, airmass, "diamond", "#2ca02c", "Airmass")
 
     # Ellipticity panel
-    _add_band_traces(ellip_row, ellipticity, "square", "#ff7f0e", "Ellipticity")
+    _add_band_traces(
+        ellip_row, ellipticity, "square", "#ff7f0e", "Ellipticity",
+        include_customdata=True,
+    )
 
     fig.update_yaxes(title_text=fwhm_label, row=1, col=1)
     if has_airmass:
@@ -2274,27 +2446,29 @@ def plot_time_series_metrics_interactive(
     position: fixed;
     bottom: 36px;
     right: 12px;
-    background: rgba(34,34,34,0.94);
-    color: #eee;
+    background: #fff;
+    color: #222;
+    border: 1px solid #d7dce2;
     border-radius: 8px;
     padding: 10px 12px;
     z-index: 9998;
     font-size: 12px;
     min-width: 270px;
     max-width: 360px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.45);
+    box-shadow: 0 6px 24px rgba(0,0,0,0.20);
     display: none;
 }}
-#amp-fwhm-panel b {{ color: #FFB74D; }}
+#amp-fwhm-panel b {{ color: #a75a00; }}
 #amp-fwhm-panel button {{
     float: right;
-    background: #555;
-    color: white;
-    border: none;
+    background: #e9edf2;
+    color: #222;
+    border: 1px solid #c8d0d9;
     border-radius: 3px;
     cursor: pointer;
     font-size: 11px;
 }}
+#amp-fwhm-panel button:hover {{ background: #dbe2ea; }}
 #amp-fwhm-panel table {{
     width: 100%;
     border-collapse: collapse;
@@ -2303,13 +2477,14 @@ def plot_time_series_metrics_interactive(
 }}
 #amp-fwhm-panel th,
 #amp-fwhm-panel td {{
-    padding: 2px 4px;
+    padding: 3px 5px;
     text-align: right;
-    border-bottom: 1px solid rgba(255,255,255,0.12);
+    border-bottom: 1px solid #e2e6ea;
 }}
 #amp-fwhm-panel th:first-child,
 #amp-fwhm-panel td:first-child {{ text-align: left; }}
-#amp-fwhm-panel .muted {{ color: #aaa; font-size: 11px; }}
+#amp-fwhm-panel .muted {{ color: #555; font-size: 11px; }}
+#amp-fwhm-panel .error {{ color: #b42318; font-size: 11px; margin-top: 6px; }}
 #fit-selected-panel {{
     position: fixed;
     bottom: 36px;
@@ -2504,11 +2679,27 @@ def plot_time_series_metrics_interactive(
     var fitPlot = document.getElementById('fit-selected-plot');
     var selectedFrames = [];
     var isFittingSelected = false;
+    var psfThumbsLoading = null;
     if (ampClose) ampClose.onclick = function() {{ ampPanel.style.display = 'none'; }};
-    fetch('psf_thumbnails.json')
-        .then(function(r) {{ return r.json(); }})
-        .then(function(d) {{ psfThumbs = d; }})
-        .catch(function() {{ psfThumbs = {{}}; }});
+    function loadPsfThumbs(force) {{
+        if (psfThumbsLoading && !force) return psfThumbsLoading;
+        psfThumbsLoading = fetch('psf_thumbnails.json?t=' + Date.now(), {{cache: 'no-store'}})
+            .then(function(r) {{
+                if (!r.ok) throw new Error('No PSF thumbnails yet');
+                return r.json();
+            }})
+            .then(function(d) {{
+                psfThumbs = d || {{}};
+                return psfThumbs;
+            }})
+            .catch(function() {{
+                if (!psfThumbs) psfThumbs = {{}};
+                return psfThumbs;
+            }})
+            .finally(function() {{ psfThumbsLoading = null; }});
+        return psfThumbsLoading;
+    }}
+    loadPsfThumbs(false);
 
     // --- Tilt map overlay click-to-close ---
     (function() {{
@@ -2516,18 +2707,30 @@ def plot_time_series_metrics_interactive(
         if (mapOverlay) mapOverlay.onclick = function() {{ mapOverlay.style.display = 'none'; }};
     }})();
 
-    function renderAmpFwhmTable(d) {{
+    function renderAmpTable(d, mode) {{
+        mode = mode || 'fwhm';
         var html = '<b>Frame ' + d.frame + '</b>';
         html += '<div class="muted">' + d.sci_file + '</div>';
         html += '<div class="muted">Focus: ' + d.focus_position + '</div>';
-        html += '<div class="muted">Median all amps: ' + d.avg_fwhm_arcsec + ' arcsec (' + d.avg_fwhm_pix + ' pix)</div>';
-        html += '<table><thead><tr><th>Amp</th><th>FWHM"</th><th>FWHM px</th><th>N</th></tr></thead><tbody>';
+        if (mode === 'ellipticity') {{
+            html += '<div class="muted">Per-amplifier median ellipticity</div>';
+            html += '<table><thead><tr><th>Amp</th><th>Ellip.</th><th>N</th></tr></thead><tbody>';
+        }} else {{
+            html += '<div class="muted">Median all amps: ' + d.avg_fwhm_arcsec + ' arcsec (' + d.avg_fwhm_pix + ' pix)</div>';
+            html += '<table><thead><tr><th>Amp</th><th>FWHM"</th><th>FWHM px</th><th>N</th></tr></thead><tbody>';
+        }}
         d.amps.forEach(function(row) {{
-            html += '<tr><td>' + row.amp + '</td><td>' +
-                    (row.fwhm_arcsec == null ? '--' : row.fwhm_arcsec.toFixed(3)) +
-                    '</td><td>' +
-                    (row.fwhm_pix == null ? '--' : row.fwhm_pix.toFixed(3)) +
-                    '</td><td>' + row.n_stars + '</td></tr>';
+            if (mode === 'ellipticity') {{
+                html += '<tr><td>' + row.amp + '</td><td>' +
+                        (row.median_e == null ? '--' : row.median_e.toFixed(4)) +
+                        '</td><td>' + row.n_stars + '</td></tr>';
+            }} else {{
+                html += '<tr><td>' + row.amp + '</td><td>' +
+                        (row.fwhm_arcsec == null ? '--' : row.fwhm_arcsec.toFixed(3)) +
+                        '</td><td>' +
+                        (row.fwhm_pix == null ? '--' : row.fwhm_pix.toFixed(3)) +
+                        '</td><td>' + row.n_stars + '</td></tr>';
+            }}
         }});
         html += '</tbody></table>';
         return html;
@@ -2558,15 +2761,16 @@ def plot_time_series_metrics_interactive(
             var frameRows = rows.filter(function(row) {{
                 return Number(row.image_number) === Number(frame);
             }});
-            if (!frameRows.length) throw new Error('No per-amplifier FWHM data found for frame ' + frame);
+            if (!frameRows.length) throw new Error('No per-amplifier data found for frame ' + frame);
             var pixscale = {pixscale if pixscale and pixscale > 0 else 0.455};
             var amps = frameRows.map(function(row) {{
                 var fwhmPix = Number(row.median_fwhm);
+                var medianE = Number(row.median_e);
                 return {{
                     amp: Number(row.amp),
                     fwhm_pix: Number.isFinite(fwhmPix) ? fwhmPix : null,
                     fwhm_arcsec: Number.isFinite(fwhmPix) ? fwhmPix * pixscale : null,
-                    median_e: Number(row.median_e),
+                    median_e: Number.isFinite(medianE) ? medianE : null,
                     n_stars: Number(row.n_stars)
                 }};
             }});
@@ -2574,14 +2778,16 @@ def plot_time_series_metrics_interactive(
                             .filter(function(v) {{ return v != null && Number.isFinite(v); }})
                             .sort(function(a, b) {{ return a - b; }});
             var mid = Math.floor(valid.length / 2);
-            var avgPix = valid.length % 2 ? valid[mid] : 0.5 * (valid[mid - 1] + valid[mid]);
+            var avgPix = valid.length
+                ? (valid.length % 2 ? valid[mid] : 0.5 * (valid[mid - 1] + valid[mid]))
+                : null;
             return {{
                 frame: Number(frame),
                 sci_file: frameRows[0].sci_file,
                 focus_position: Number(frameRows[0].focus_position).toFixed(4),
                 pixscale: pixscale,
-                avg_fwhm_pix: avgPix.toFixed(4),
-                avg_fwhm_arcsec: (avgPix * pixscale).toFixed(4),
+                avg_fwhm_pix: avgPix == null ? null : avgPix.toFixed(4),
+                avg_fwhm_arcsec: avgPix == null ? null : (avgPix * pixscale).toFixed(4),
                 amps: amps
             }};
         }}
@@ -2618,6 +2824,15 @@ def plot_time_series_metrics_interactive(
         }});
     }}
 
+    function ampLoadErrorMessage(err) {{
+        var msg = err && err.message ? err.message : String(err);
+        if (msg.indexOf('Failed to fetch') !== -1 ||
+            msg.indexOf('focus_per_amp_points.ecsv not found') !== -1) {{
+            return 'Could not load per-amplifier table. Open the dashboard through the monitor or an HTTP server, not by double-clicking the HTML file.';
+        }}
+        return msg;
+    }}
+
     function showTiltAndAmpTable(frame) {{
         var mapOverlay = document.getElementById('tilt-map-overlay');
         var mapImg = document.getElementById('tilt-map-img');
@@ -2643,10 +2858,36 @@ def plot_time_series_metrics_interactive(
         return null;
     }}
 
+    function isEllipticityPoint(pt) {{
+        return !!(pt && pt.data && pt.data.name &&
+                  String(pt.data.name).toLowerCase().indexOf('ellipticity') !== -1);
+    }}
+
+    function isFwhmPoint(pt) {{
+        return !!(pt && pt.data && pt.data.name &&
+                  String(pt.data.name).toLowerCase().indexOf('fwhm') !== -1);
+    }}
+
+    function showAmpEllipticityPanel(pt) {{
+        var frame = frameFromPoint(pt);
+        if (frame == null || !Number.isFinite(frame) || !ampPanel || !ampContent) return;
+        ampPanel.style.display = 'block';
+        ampContent.innerHTML = '<b>Frame ' + frame + '</b><div class="muted">Loading amp ellipticity...</div>';
+        loadAmpFwhm(frame)
+        .then(function(d) {{
+            ampContent.innerHTML = renderAmpTable(d, 'ellipticity');
+        }})
+        .catch(function(err) {{
+            ampContent.innerHTML = '<b>Frame ' + frame + '</b><div class="muted">' +
+                                   ampLoadErrorMessage(err) + '</div>';
+        }});
+    }}
+
     function updateSelectedFrames(points) {{
         var seen = {{}};
         selectedFrames = [];
         (points || []).forEach(function(pt) {{
+            if (!isFwhmPoint(pt)) return;
             var frame = frameFromPoint(pt);
             if (frame == null || !Number.isFinite(frame) || seen[frame]) return;
             seen[frame] = true;
@@ -2725,13 +2966,25 @@ def plot_time_series_metrics_interactive(
         // --- PSF hover overlay (thumbnails loaded from psf_thumbnails.json) ---
         gd.on('plotly_hover', function(data) {{
             var pt = data.points[0];
-            if (pt && pt.customdata != null && psfThumbs) {{
-                var b64 = psfThumbs[String(pt.customdata[0])];
+            if (!isFwhmPoint(pt)) {{
+                overlay.style.display = 'none';
+                return;
+            }}
+            if (pt && pt.customdata != null) {{
+                var frameKey = String(pt.customdata[0]);
+                var b64 = psfThumbs && psfThumbs[frameKey];
                 if (b64) {{
                     psfImg.src = 'data:image/png;base64,' + b64;
                     overlay.style.display = 'block';
                     return;
                 }}
+                loadPsfThumbs(true).then(function(thumbs) {{
+                    var refreshed = thumbs && thumbs[frameKey];
+                    if (refreshed) {{
+                        psfImg.src = 'data:image/png;base64,' + refreshed;
+                        overlay.style.display = 'block';
+                    }}
+                }});
             }}
             overlay.style.display = 'none';
         }});
@@ -2739,21 +2992,26 @@ def plot_time_series_metrics_interactive(
             overlay.style.display = 'none';
         }});
 
-        // --- Click any point -> show per-amplifier FWHM without writing PNGs ---
+        // --- Click FWHM points for tilt/FWHM; click ellipticity points for amp ellipticity ---
         gd.on('plotly_click', function(data) {{
             var pt = data.points && data.points[0];
             if (!pt || !pt.customdata || pt.customdata[0] == null) return;
+            if (isEllipticityPoint(pt)) {{
+                showAmpEllipticityPanel(pt);
+                return;
+            }}
+            if (!isFwhmPoint(pt)) return;
             var frame = pt.customdata[0];
             showTiltAndAmpTable(frame);
             if (ampPanel) ampPanel.style.display = 'none';
             loadAmpFwhm(frame)
             .then(function(d) {{
-                document.getElementById('amp-detail-content').innerHTML = renderAmpFwhmTable(d);
+                document.getElementById('amp-detail-content').innerHTML = renderAmpTable(d, 'fwhm');
             }})
             .catch(function(fallbackErr) {{
                 document.getElementById('amp-detail-content').innerHTML =
                     '<b>Frame ' + frame + '</b><div class="error">' +
-                    fallbackErr.message + '</div>';
+                    ampLoadErrorMessage(fallbackErr) + '</div>';
             }});
         }});
 
@@ -2847,6 +3105,27 @@ def parse_arguments() -> argparse.Namespace:
         help="Amplifier numbers to include (1-indexed)",
     )
     parser.add_argument("--threshold", type=float, default=25.0, help="SEP detection threshold")
+    parser.add_argument(
+        "--fwhm-method",
+        choices=("direct", "moffat", "gaussian"),
+        default="direct",
+        help=(
+            "Per-star FWHM measurement method. 'direct' measures the radial "
+            "half-maximum crossing and is the default; 'moffat' fits a Moffat "
+            "profile; 'gaussian' preserves the previous Gaussian radial fit."
+        ),
+    )
+    parser.add_argument(
+        "--gmm-fwhm-method",
+        choices=("same", "direct", "moffat", "gaussian"),
+        default="same",
+        help=(
+            "FWHM feature used by the GMM star selector. Use 'same' to reuse "
+            "--fwhm-method (default). For example, '--fwhm-method direct "
+            "--gmm-fwhm-method gaussian' reports direct half-max FWHM while "
+            "selecting stars with the previous Gaussian radial FWHM feature."
+        ),
+    )
     parser.add_argument(
         "--mask-dir",
         type=str,
@@ -2953,8 +3232,13 @@ def main():
     args = parse_arguments()
     data_dir = Path(args.data_dir)
     outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
     mask_dir = Path(args.mask_dir)
+    data_dir_resolved = data_dir.resolve()
+    if outdir.resolve() == data_dir_resolved:
+        raise RuntimeError("Refusing to use the raw data directory as --outdir")
+    if mask_dir.resolve() == data_dir_resolved:
+        raise RuntimeError("Refusing to use the raw data directory as --mask-dir")
+    outdir.mkdir(parents=True, exist_ok=True)
     mask_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -3039,7 +3323,6 @@ def main():
     cache_inputs = {
         "data_dir": str(data_dir.resolve()),
         "mask_dir": str(mask_dir.resolve()),
-        "active_bands": active_bands,
         "auto_generate_masks": bool(args.auto_generate_masks),
         "mask_saturation": {
             "sat_mult": args.mask_sat_mult,
@@ -3047,6 +3330,8 @@ def main():
             "sat_frac": args.mask_sat_frac,
             "black_frac": args.mask_black_frac,
         },
+        "fwhm_method": args.fwhm_method,
+        "gmm_fwhm_method": args.gmm_fwhm_method,
         "bias_files": [_file_fingerprint(p) for p in bias_files_for_cache],
         "dark_files": [_file_fingerprint(p) for p in dark_files_for_cache],
         "flat_files_by_band": {
@@ -3061,74 +3346,74 @@ def main():
     # ------------------------------------------------------------------
     # master_cache_per_band[band][amp] = (master_bias, _, _, master_flat)
     master_cache_per_band: Dict[str, Dict[int, Tuple]] = {}
-    masters_from_cache = False
 
     if args.incremental:
         _validate_cache_params(cache_dir, args.threshold, list(args.amps), cache_inputs)
-        loaded_all = True
+        n_cached_masters = 0
         for band in active_bands:
             master_cache_per_band[band] = {}
             for amp in args.amps:
                 cached = _load_master_calibrations(cache_dir, amp, band=band)
                 if cached is not None:
                     master_cache_per_band[band][amp] = cached
-                else:
-                    loaded_all = False
-                    break
-            if not loaded_all:
-                break
-        if loaded_all:
-            masters_from_cache = True
+                    n_cached_masters += 1
+        if n_cached_masters == len(active_bands) * len(args.amps):
             print(f"Loaded cached master calibrations for {len(active_bands)} band(s) "
                   f"× {len(args.amps)} amps")
+        elif n_cached_masters:
+            n_expected = len(active_bands) * len(args.amps)
+            print(f"Loaded {n_cached_masters}/{n_expected} cached master calibrations; "
+                  "building only missing ones")
+
+    bias_files = bias_files_for_cache
+    dark_files = dark_files_for_cache
+
+    for band in active_bands:
+        master_cache_per_band.setdefault(band, {})
+        missing_amps = [amp for amp in args.amps if amp not in master_cache_per_band[band]]
+        if not missing_amps:
+            continue
+
+        # Select flats for this band
+        flat_pool = categorized[band]["flat"]
+        if args.flat_nums:
+            flat_files = select_files_by_numbers(flat_pool, requested_flat_numbers)
         else:
-            master_cache_per_band = {}  # reset partial load
+            flat_files = sorted(flat_pool)  # auto: use all available flats
+        if not flat_files:
+            raise RuntimeError(
+                f"No {band.lower()}-band flats selected. "
+                "Omit --flat-nums for automatic per-band flats, or include "
+                "flat numbers for every science band."
+            )
+        print(f"\nBuilding master calibrations for {band.lower()}-band "
+              f"({len(flat_files)} flats; amps {missing_amps}) ...")
 
-    if not masters_from_cache:
-        bias_files = bias_files_for_cache
-        dark_files = dark_files_for_cache
-
-        for band in active_bands:
-            # Select flats for this band
-            flat_pool = categorized[band]["flat"]
-            if args.flat_nums:
-                flat_files = select_files_by_numbers(flat_pool, requested_flat_numbers)
-            else:
-                flat_files = sorted(flat_pool)  # auto: use all available flats
-            if not flat_files:
-                raise RuntimeError(
-                    f"No {band.lower()}-band flats selected. "
-                    "Omit --flat-nums for automatic per-band flats, or include "
-                    "flat numbers for every science band."
-                )
-            print(f"\nBuilding master calibrations for {band.lower()}-band "
-                  f"({len(flat_files)} flats) ...")
-
-            master_cache_per_band[band] = {}
-            for amp in args.amps:
-                biases, darks, flats, _ = diff_amp(
-                    amp, bias_files, dark_files, flat_files, sci_files[:1],
-                )
-                cal = flat_reduction_b(biases, darks, flats)
-                master_cache_per_band[band][amp] = cal
+        for amp in missing_amps:
+            biases, darks, flats, _ = diff_amp(
+                amp, bias_files, dark_files, flat_files, sci_files[:1],
+            )
+            cal = flat_reduction_b(biases, darks, flats)
+            master_cache_per_band[band][amp] = cal
+            if args.incremental:
                 _save_master_calibrations(cache_dir, amp, cal, band=band)
 
-                mask_path = mask_dir / f"bad_pixel_mask_amp_{band}{amp}.npy"
-                if args.auto_generate_masks or not mask_path.exists():
-                    master_flat = cal[3]
-                    median_flat = np.median(master_flat)
-                    std_flat = np.std(master_flat)
-                    sat_threshold = median_flat + args.mask_sat_mult * std_flat
-                    black_threshold = median_flat - args.mask_black_mult * std_flat
-                    bad_cols = find_bad_columns(
-                        master_flat,
-                        sat_threshold,
-                        black_threshold,
-                        args.mask_sat_frac,
-                        args.mask_black_frac,
-                    )
-                    mask_map = create_bad_pixel_map(master_flat.shape, bad_cols)
-                    np.save(mask_path, mask_map)
+            mask_path = mask_dir / f"bad_pixel_mask_amp_{band}{amp}.npy"
+            if args.auto_generate_masks or not mask_path.exists():
+                master_flat = cal[3]
+                median_flat = np.median(master_flat)
+                std_flat = np.std(master_flat)
+                sat_threshold = median_flat + args.mask_sat_mult * std_flat
+                black_threshold = median_flat - args.mask_black_mult * std_flat
+                bad_cols = find_bad_columns(
+                    master_flat,
+                    sat_threshold,
+                    black_threshold,
+                    args.mask_sat_frac,
+                    args.mask_black_frac,
+                )
+                mask_map = create_bad_pixel_map(master_flat.shape, bad_cols)
+                np.save(mask_path, mask_map)
 
     # ------------------------------------------------------------------
     # Source detection loop — per-file, using matching band's flat
@@ -3140,9 +3425,18 @@ def main():
 
     for file_idx, (sci_path, band) in enumerate(zip(sci_files, sci_bands)):
         master_cache = master_cache_per_band[band]
+        det_meta = _detection_cache_meta(
+            sci_path,
+            band,
+            args.threshold,
+            list(args.amps),
+            args.fwhm_method,
+            args.gmm_fwhm_method,
+            mask_dir,
+        )
 
         if args.incremental:
-            cached = _load_file_detections(cache_dir, sci_path)
+            cached = _load_file_detections(cache_dir, sci_path, det_meta)
             if cached is not None:
                 tab, cutouts = cached
                 # Rewrite subset_id to match current file position
@@ -3161,10 +3455,12 @@ def main():
         tab, cutouts = _detect_single_file(
             sci_path, file_idx, list(args.amps), master_cache,
             band, mask_dir, args.threshold, outdir, args.write_reduced,
+            args.fwhm_method,
+            args.gmm_fwhm_method,
         )
         if tab is not None:
             if args.incremental:
-                _save_file_detections(cache_dir, sci_path, tab, cutouts)
+                _save_file_detections(cache_dir, sci_path, tab, cutouts, det_meta)
             all_tables.append(tab)
             all_cutouts.extend(cutouts)
             n_processed += 1
@@ -3308,6 +3604,31 @@ def main():
         import json as _json
         import re as _re_st
         _rnum_st = _re_st.compile(r"(\d+)")
+        tilt_cache_signature = {
+            "amps": sorted(int(a) for a in args.amps),
+            "threshold": float(args.threshold),
+            "fwhm_method": args.fwhm_method,
+            "gmm_fwhm_method": args.gmm_fwhm_method,
+            "pixscale": float(args.pixscale),
+            "fit_mode": "global" if getattr(args, "global_tilt_fit", False) else "per_frame",
+            "cache_inputs": cache_inputs,
+        }
+
+        def _tilt_cache_valid(idx: int, num: Optional[int]) -> bool:
+            if num is None:
+                return False
+            json_path = outdir / f"tilt_result_{num}.json"
+            map_path = outdir / f"tilt_map_{num}.png"
+            if not (json_path.exists() and map_path.exists()):
+                return False
+            try:
+                payload = _json.loads(json_path.read_text())
+            except Exception:
+                return False
+            return (
+                payload.get("cache_signature") == tilt_cache_signature
+                and payload.get("science_fingerprint") == _file_fingerprint(sci_files[idx])
+            )
 
         # Build (index, image_number) list once
         sci_idx_nums: List[tuple] = []
@@ -3328,6 +3649,19 @@ def main():
             targets = [(i, n) for i, n in sci_idx_nums if n is not None]
             print(f"  Pre-computing tilt for {len(targets)} frames "
                   "(use --solve-tilt-frame N to limit to one).")
+            if not getattr(args, "global_tilt_fit", False):
+                uncached_targets = []
+                for i, n in targets:
+                    if not _tilt_cache_valid(i, n):
+                        uncached_targets.append((i, n))
+                n_cached_tilt = len(targets) - len(uncached_targets)
+                if n_cached_tilt:
+                    print(f"  Reusing cached tilt products for {n_cached_tilt} frames")
+                targets = uncached_targets
+                if targets:
+                    print(f"  Computing tilt for {len(targets)} new/missing frames")
+                else:
+                    print("  All tilt products are already cached")
 
         # Pre-compute shared catalog arrays once
         sid_col = stacked["subset_id"] if "subset_id" in stacked.colnames else None
@@ -3440,6 +3774,8 @@ def main():
                     "R2": float(tilt_result["R2"]),
                     "tilt_map_png": map_name,
                     "fit_mode": "global" if global_result is not None else "per_frame",
+                    "cache_signature": tilt_cache_signature,
+                    "science_fingerprint": _file_fingerprint(sci_files[_idx]),
                 }
                 with open(outdir / json_name, "w") as _fp:
                     _json.dump(payload, _fp, indent=2)
@@ -3466,6 +3802,21 @@ def main():
                       f"default = frame {default_payload.get('image_number')}.")
             else:
                 print("  No frames produced a valid tilt solution.")
+
+            if default_payload is None and requested is None:
+                # No new tilt frames were computed; refresh the default pointers
+                # from an existing middle-frame product when possible.
+                mid = len(sci_files) // 2
+                mid_num = sci_idx_nums[mid][1]
+                candidate = outdir / f"tilt_result_{mid_num}.json"
+                if candidate.exists():
+                    default_payload = _json.loads(candidate.read_text())
+                    with open(outdir / "tilt_result.json", "w") as _fp:
+                        _json.dump(default_payload, _fp, indent=2)
+                    src_map = outdir / default_payload.get("tilt_map_png", "")
+                    if src_map.exists():
+                        import shutil as _sh
+                        _sh.copyfile(src_map, outdir / "tilt_map.png")
 
     time_table = build_time_series_table(
         stacked,

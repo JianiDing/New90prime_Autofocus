@@ -8,8 +8,9 @@ For each of the 8 amps (IM1..IM8) writes one PNG with 4 panels:
   4. Overscan (BIASSEC, OBJECT) std
 
 Outputs:
-  bias_trend_<AMP>.png   (× 8)
-  bias_trend.csv         (long-format: source, amp, folder, file, time, mean, std)
+  bias_trend_<AMP>.png       (× 8)
+  bias_trend_temp_<AMP>.png  (× 8, if a temperature keyword is available)
+  bias_trend.csv             (long-format: source, amp, folder, file, time, mean, std, temp)
 """
 
 from __future__ import annotations
@@ -98,6 +99,23 @@ def parse_obs_time(header):
         return datetime.fromisoformat(f"{date}T{ut}").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def parse_temperature(header, preferred_key="CAMTEMP"):
+    """Return (temperature, key) from the primary header, or (None, None)."""
+    keys = [preferred_key, "CAMTEMP", "CCDTEMP1", "CCDTEMP", "DEWTEMP", "DOME_DEW"]
+    seen = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if key not in header:
+            continue
+        try:
+            return float(header[key]), key
+        except (TypeError, ValueError):
+            continue
+    return None, None
 
 
 def is_object_frame(header):
@@ -212,7 +230,7 @@ def measure_per_amp_overscan(path, mask_dir=None):
 
 # ---------- collection ----------
 
-def collect(folders, mask_dir=None):
+def collect(folders, mask_dir=None, temp_key="CAMTEMP"):
     """Return (bias_rows, over_rows). Each row has amp, folder, file, time, mean, std."""
     bias_rows: list[dict] = []
     over_rows: list[dict] = []
@@ -238,10 +256,12 @@ def collect(folders, mask_dir=None):
             t = parse_obs_time(hdr)
             if t is None:
                 continue
+            temp, used_temp_key = parse_temperature(hdr, temp_key)
             for amp, (mean, std) in measure_per_amp_full(f, mask_dir).items():
                 bias_rows.append({"amp": amp, "folder": fname,
                                   "file": os.path.basename(f),
-                                  "time": t, "mean": mean, "std": std})
+                                  "time": t, "mean": mean, "std": std,
+                                  "temp": temp, "temp_key": used_temp_key})
 
         # object frames
         all_files = sorted(glob.glob(os.path.join(folder, "*.fits")))
@@ -257,10 +277,12 @@ def collect(folders, mask_dir=None):
             t = parse_obs_time(hdr)
             if t is None:
                 continue
+            temp, used_temp_key = parse_temperature(hdr, temp_key)
             for amp, (mean, std) in measure_per_amp_overscan(f, mask_dir).items():
                 over_rows.append({"amp": amp, "folder": fname,
                                   "file": os.path.basename(f),
-                                  "time": t, "mean": mean, "std": std})
+                                  "time": t, "mean": mean, "std": std,
+                                  "temp": temp, "temp_key": used_temp_key})
 
         print(f"{folder}: {len(bias_files)} bias  /  {n_obj} object frames")
 
@@ -313,13 +335,60 @@ def plot_per_amp(amp, bias_rows, over_rows, colors, outpath):
     print(f"saved → {outpath}")
 
 
+def _scatter_temp(ax, rows, key, colors):
+    folders = sorted({r["folder"] for r in rows})
+    for folder in folders:
+        sub = [r for r in rows if r["folder"] == folder and r.get("temp") is not None]
+        if not sub:
+            continue
+        ax.plot([r["temp"] for r in sub], [r[key] for r in sub],
+                "o", ms=4, color=colors[folder], label=folder, alpha=0.8)
+
+
+def plot_per_amp_temperature(amp, bias_rows, over_rows, colors, outpath):
+    fig, axes = plt.subplots(4, 1, figsize=(13, 12), constrained_layout=True)
+    ax_bm, ax_bs, ax_om, ax_os = axes
+
+    _scatter_temp(ax_bm, bias_rows, "mean", colors)
+    _scatter_temp(ax_bs, bias_rows, "std",  colors)
+    _scatter_temp(ax_om, over_rows, "mean", colors)
+    _scatter_temp(ax_os, over_rows, "std",  colors)
+
+    temp_keys = sorted({r.get("temp_key") for r in (*bias_rows, *over_rows) if r.get("temp_key")})
+    xlabel = "Temperature (C)"
+    if temp_keys:
+        xlabel = f"Temperature ({'/'.join(temp_keys)}, C)"
+
+    panels = [
+        (ax_bm, "Bias frame — mean (ADU)"),
+        (ax_bs, "Bias frame — std (ADU)"),
+        (ax_om, "Overscan (BIASSEC, OBJECT) — mean (ADU)"),
+        (ax_os, "Overscan (BIASSEC, OBJECT) — std (ADU)"),
+    ]
+    for ax, ylabel in panels:
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        if ax.get_lines():
+            ax.legend(loc="best", fontsize=9)
+
+    axes[-1].set_xlabel(xlabel)
+    fig.suptitle(f"Bok 90Prime — bias level trends vs temperature  —  amp {amp}",
+                 fontsize=14)
+    fig.savefig(outpath, dpi=130)
+    plt.close(fig)
+    print(f"saved → {outpath}")
+
+
 def write_csv(bias_rows, over_rows, outpath):
     with open(outpath, "w") as f:
-        f.write("source,amp,folder,file,time_utc,mean,std\n")
+        f.write("source,amp,folder,file,time_utc,mean,std,temp_c,temp_key\n")
         for src, rows in (("bias", bias_rows), ("overscan", over_rows)):
             for r in rows:
+                temp = "" if r.get("temp") is None else f"{r['temp']:.4f}"
+                temp_key = r.get("temp_key") or ""
                 f.write(f"{src},{r['amp']},{r['folder']},{r['file']},"
-                        f"{r['time'].isoformat()},{r['mean']:.4f},{r['std']:.4f}\n")
+                        f"{r['time'].isoformat()},{r['mean']:.4f},{r['std']:.4f},"
+                        f"{temp},{temp_key}\n")
     print(f"saved csv → {outpath}")
 
 
@@ -333,9 +402,13 @@ def main():
     p.add_argument("--mask-dir", default=None,
                    help="Directory of bad-pixel masks (bad_pixel_mask_amp_<BAND><N>.npy). "
                         "If given, bad pixels are excluded from the bias stats.")
+    p.add_argument("--temp-key", default="CAMTEMP",
+                   help="Preferred primary-header temperature keyword for temperature plots.")
+    p.add_argument("--temperature-only", action="store_true",
+                   help="Only write the CSV and temperature plots; do not write time-trend PNGs.")
     args = p.parse_args()
 
-    bias_rows, over_rows = collect(args.folders, mask_dir=args.mask_dir)
+    bias_rows, over_rows = collect(args.folders, mask_dir=args.mask_dir, temp_key=args.temp_key)
     print(f"\nUsable bias rows:    {len(bias_rows)}")
     print(f"Usable overscan rows: {len(over_rows)}")
 
@@ -365,8 +438,12 @@ def main():
     for amp in amps:
         b = [r for r in bias_rows if r["amp"] == amp]
         o = [r for r in over_rows if r["amp"] == amp]
-        outpath = f"{out_prefix}_{amp}.png"
-        plot_per_amp(amp, b, o, colors, outpath)
+        if not args.temperature_only:
+            outpath = f"{out_prefix}_{amp}.png"
+            plot_per_amp(amp, b, o, colors, outpath)
+        if any(r.get("temp") is not None for r in (*b, *o)):
+            temp_outpath = f"{out_prefix}_vs_temperature_{amp}.png"
+            plot_per_amp_temperature(amp, b, o, colors, temp_outpath)
 
 
 if __name__ == "__main__":

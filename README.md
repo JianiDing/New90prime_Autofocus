@@ -50,6 +50,7 @@ python focus_pipeline.py \
   --mask-dir bad_pixel_masks \
   --outdir focus_output \
   --pixscale 0.455 \
+  --fwhm-method direct \
   --solve-tilt
 ```
 
@@ -70,6 +71,12 @@ python focus_pipeline.py \
 ```
 
 `--dark-nums` is optional. Omit it when no dark correction is desired.
+`--fwhm-method direct` is the default and measures the radial half-maximum
+crossing. Use `--fwhm-method moffat` to fit Moffat profiles, or
+`--fwhm-method gaussian` to reproduce the previous Gaussian radial fit.
+Use `--gmm-fwhm-method gaussian` with `--fwhm-method direct` when you want the
+GMM star selector to use the Gaussian radial FWHM feature while reporting the
+direct half-maximum FWHM as the seeing value.
 
 If you pass explicit `--flat-nums` in a multi-band run, those flat numbers must
 include flats for every science band being processed. Bands with no matching
@@ -151,6 +158,8 @@ Add `--auto-generate-masks` to let the script build 2-D bad-pixel maps from the 
 | `--focus-key` | No (default `LVDTC`) | FITS header keyword that stores the focus position. |
 | `--amps` | No (default `1 2 3 4 5 6 7 8`) | Amplifier IDs (HDU numbers) to analyze. |
 | `--threshold` | No (default `25`) | SEP detection threshold. |
+| `--fwhm-method` | No (default `direct`) | Star FWHM method: direct radial half-maximum, Moffat fit, or previous Gaussian radial fit. |
+| `--gmm-fwhm-method` | No (default `same`) | FWHM feature for GMM star selection. Use `gaussian` with `--fwhm-method direct` to select stars with Gaussian FWHM but report direct FWHM. |
 | `--mask-dir` | No (default `bad_pixel_masks`) | Directory containing the bad-pixel mask `.npy` files. |
 | `--outdir` | No (default `focus_output`) | Directory for reduced products and plots. |
 | `--write-reduced` / `--skip-reduced` | Optional flags | Force writing (or skipping) `_amp*_reduced.fits` files for each science image and amplifier. Default behavior skips writing unless `--write-reduced` is present. |
