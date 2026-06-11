@@ -34,6 +34,21 @@ except ImportError:
     HAS_PLOTLY = False
 
 
+# Star-selection / detection tuning. Values are overwritten from the CLI in
+# main(); module-level so sep_run_2/compute_gmm_labels callers need no new
+# arguments. satlevel/max_stars_per_amp of None disable the respective cut.
+STAR_SELECTION_CONFIG = {
+    "satlevel": 60000.0,       # ADU; peaks above this count as saturated
+    "min_star_fwhm": 1.5,      # px; below this is cosmic rays / hot pixels
+    "max_star_e": 0.5,         # ellipticity cut applied before clustering
+    "max_star_med_e": 0.3,     # median-e ceiling for a component to be stellar
+    "gmm_min_sources": 15,     # below this, skip the GMM and MAD-clip instead
+    "max_stars_per_amp": 100,  # keep only the brightest N sources per amp
+    "min_sources_retry": 20,   # re-extract at lower threshold below this count
+    "retry_thresholds": (10.0, 5.0),
+}
+
+
 # ---------------------------------------------------------------------------
 # Utility functions mostly copied from the notebook with minimal edits
 # ---------------------------------------------------------------------------
@@ -516,11 +531,54 @@ def sep_run_2(
         minarea=minarea,
     )
 
+    # Sparse field: retry at progressively lower thresholds so few-star
+    # frames still yield enough sources for a robust FWHM estimate. Rich
+    # fields never reach this, so the extra cost stays confined to frames
+    # where extraction is cheap anyway.
+    n_found = 0 if objects is None else len(objects)
+    for retry_thresh in STAR_SELECTION_CONFIG["retry_thresholds"]:
+        if n_found >= STAR_SELECTION_CONFIG["min_sources_retry"]:
+            break
+        if retry_thresh >= threshold:
+            continue
+        objects, segmap = sep.extract(
+            data_sub,
+            thresh=retry_thresh,
+            err=bkg.globalrms,
+            segmentation_map=True,
+            minarea=max(8, minarea // 2),
+        )
+        n_found = 0 if objects is None else len(objects)
+        if verbose:
+            print(
+                f"Sparse field: re-extracted at {retry_thresh}σ → {n_found} objects"
+            )
+
     if objects is None:
         if verbose:
             print("No objects returned by sep.extract")
         empty = np.array([])
         return data_sub, None, empty, empty, empty, empty, empty, empty, []
+
+    # Cap rich fields to the brightest unsaturated sources before the
+    # per-object radial-profile loop (the CPU hot spot). The FWHM median
+    # from ~100 bright stars matches the full catalog's.
+    max_stars = STAR_SELECTION_CONFIG["max_stars_per_amp"]
+    if max_stars and len(objects) > max_stars:
+        flux_all = np.array(objects["flux"], dtype=float)
+        pool = np.ones(len(objects), dtype=bool)
+        satlevel = STAR_SELECTION_CONFIG["satlevel"]
+        if satlevel is not None:
+            unsat = np.array(objects["peak"], dtype=float) < satlevel
+            # Only exclude saturated sources when enough remain; a wrong
+            # satlevel must not empty the catalog
+            if np.count_nonzero(unsat) >= min(max_stars, STAR_SELECTION_CONFIG["min_sources_retry"]):
+                pool = unsat
+        pool_idx = np.where(pool)[0]
+        brightest = pool_idx[np.argsort(flux_all[pool_idx])[::-1][:max_stars]]
+        objects = objects[np.sort(brightest)]
+        if verbose:
+            print(f"Capped catalog to brightest {len(objects)} sources")
 
     if verbose:
         print("Number of objects detected:", len(objects))
@@ -629,38 +687,101 @@ def _parse_file_idx_array(sid_all: np.ndarray) -> np.ndarray:
     return result
 
 
+def _fwhm_mad(values: np.ndarray) -> Tuple[float, float]:
+    """Median and scaled MAD (robust sigma) of an array."""
+    med = float(np.nanmedian(values))
+    mad = 1.4826 * float(np.nanmedian(np.abs(values - med)))
+    return med, mad
+
+
 def compute_gmm_labels(tbl_cutt: Table) -> np.ndarray:
+    """Label each source as star (0) or non-star (1).
+
+    Hard physical cuts first remove saturated stars, cosmic rays / hot
+    pixels and elongated galaxies regardless of clustering. Then a GMM is
+    fit with the number of components chosen by BIC (1 or 2): a single
+    component means everything that survived the cuts is stellar, so a
+    clean star field is not force-split. With two components, the star
+    component is the tight low-ellipticity cluster (smallest FWHM scatter)
+    rather than the smallest median FWHM, so compact junk or the
+    noise-biased faint population cannot steal the star label — including
+    on defocused frames where stars are large. Below ``gmm_min_sources``
+    the GMM is skipped entirely in favour of MAD clipping, which also
+    handles the 1-2 star case that previously returned no stars at all.
+    """
+    cfg = STAR_SELECTION_CONFIG
     gmm_fwhm_col = "FWHM_select" if "FWHM_select" in tbl_cutt.colnames else "FWHM"
-    fwhm_vals = np.array(tbl_cutt[gmm_fwhm_col])
-    flux_ratio_vals = np.array(tbl_cutt["flux_ratio"])
-    flux_vals = np.array(tbl_cutt["flux"])
+    fwhm_vals = np.array(tbl_cutt[gmm_fwhm_col], dtype=float)
+    flux_ratio_vals = np.array(tbl_cutt["flux_ratio"], dtype=float)
+    flux_vals = np.array(tbl_cutt["flux"], dtype=float)
     mag_vals = -2.5 * np.log10(np.clip(flux_vals, 1e-12, None))
-    e_vals = np.array(tbl_cutt["e"])
+    e_vals = np.array(tbl_cutt["e"], dtype=float)
 
     Xt = np.column_stack([fwhm_vals, flux_ratio_vals, mag_vals, e_vals])
-    # Drop rows with any NaN values
     valid = np.all(np.isfinite(Xt), axis=1)
-    Xt_valid = Xt[valid]
-    fwhm_valid = fwhm_vals[valid]
-    if Xt_valid.shape[0] < 2:
-        # Not enough valid data for GMM, return all ones (non-star)
-        return np.ones_like(fwhm_vals, dtype=int)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(Xt_valid)
 
-    gmm = GaussianMixture(n_components=2, random_state=0)
-    labelst_valid = gmm.fit_predict(X_scaled)
+    candidate = (
+        valid
+        & (fwhm_vals > cfg["min_star_fwhm"])
+        & (e_vals < cfg["max_star_e"])
+    )
+    if cfg["satlevel"] is not None and "peak" in tbl_cutt.colnames:
+        peak_vals = np.array(tbl_cutt["peak"], dtype=float)
+        sat_ok = candidate & (peak_vals < cfg["satlevel"])
+        # Keep the cut only if enough sources survive; a misconfigured
+        # satlevel must not wipe out the frame
+        if np.count_nonzero(sat_ok) >= 3:
+            candidate = sat_ok
+    if np.count_nonzero(candidate) < 3 and np.count_nonzero(valid) >= 3:
+        candidate = valid
 
-    unique_labels = np.unique(labelst_valid)
-    medians = []
-    for lbl in unique_labels:
-        med = np.nanmedian(fwhm_valid[labelst_valid == lbl]) if np.any(labelst_valid == lbl) else np.inf
-        medians.append((lbl, med))
-    star_label = min(medians, key=lambda x: x[1])[0]
-    # Map back to original indices: assign 0 for star, 1 for non-star, NaN rows as 1
-    out = np.ones_like(fwhm_vals, dtype=int)
-    out_idx = np.where(valid)[0]
-    out[out_idx[labelst_valid == star_label]] = 0
+    out = np.ones(len(fwhm_vals), dtype=int)
+    idx = np.where(candidate)[0]
+    if idx.size == 0:
+        return out
+
+    # Few sources: clustering is meaningless, keep everything within
+    # 3 robust sigma of the median FWHM instead of discarding the frame.
+    if idx.size < cfg["gmm_min_sources"]:
+        med, mad = _fwhm_mad(fwhm_vals[idx])
+        tol = 3.0 * max(mad, 0.1)
+        out[idx[np.abs(fwhm_vals[idx] - med) <= tol]] = 0
+        return out
+
+    X_scaled = StandardScaler().fit_transform(Xt[idx])
+    gmm1 = GaussianMixture(n_components=1, random_state=0).fit(X_scaled)
+    gmm2 = GaussianMixture(n_components=2, random_state=0, n_init=5).fit(X_scaled)
+    if gmm1.bic(X_scaled) <= gmm2.bic(X_scaled):
+        out[idx] = 0
+        return out
+
+    labels = gmm2.predict(X_scaled)
+    fwhm_sub = fwhm_vals[idx]
+    e_sub = e_vals[idx]
+    stats = []
+    for lbl in np.unique(labels):
+        members = labels == lbl
+        med_f, mad_f = _fwhm_mad(fwhm_sub[members])
+        med_e = float(np.nanmedian(e_sub[members]))
+        stats.append((lbl, int(np.count_nonzero(members)), med_f, mad_f, med_e))
+
+    # Star component = tightest FWHM locus among round, populated clusters;
+    # median FWHM only breaks ties
+    eligible = [s for s in stats if s[1] >= 5 and s[4] < cfg["max_star_med_e"]]
+    if not eligible:
+        eligible = [s for s in stats if s[1] >= 5] or stats
+    star_lbl, _, star_med, star_mad, _ = min(eligible, key=lambda s: (s[3], s[2]))
+    out[idx[labels == star_lbl]] = 0
+
+    # If the other component is also round with a consistent FWHM, the GMM
+    # split the stellar locus (e.g. bright vs faint stars) — keep both
+    for lbl, n_k, med_f, mad_f, med_e in stats:
+        if lbl == star_lbl:
+            continue
+        if med_e < cfg["max_star_med_e"] and abs(med_f - star_med) <= 3.0 * max(
+            star_mad, mad_f, 0.1
+        ):
+            out[idx[labels == lbl]] = 0
     return out
 
 
@@ -3106,6 +3227,35 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--threshold", type=float, default=25.0, help="SEP detection threshold")
     parser.add_argument(
+        "--satlevel",
+        type=float,
+        default=60000.0,
+        help=(
+            "Detector saturation level in ADU. Sources peaking above this "
+            "are excluded from star selection and from the brightest-N cap. "
+            "Set <= 0 to disable (default: 60000)."
+        ),
+    )
+    parser.add_argument(
+        "--max-stars-per-amp",
+        type=int,
+        default=100,
+        help=(
+            "Keep only the brightest N unsaturated sources per amplifier "
+            "before the per-star FWHM measurement loop; big CPU saving on "
+            "rich fields with no loss in the FWHM median. Set 0 to disable "
+            "(default: 100)."
+        ),
+    )
+    parser.add_argument(
+        "--no-adaptive-threshold",
+        action="store_true",
+        help=(
+            "Disable the automatic re-extraction at lower SEP thresholds "
+            "(10σ, then 5σ) when a frame/amp yields few sources."
+        ),
+    )
+    parser.add_argument(
         "--fwhm-method",
         choices=("direct", "moffat", "gaussian"),
         default="direct",
@@ -3230,6 +3380,12 @@ def parse_arguments() -> argparse.Namespace:
 
 def main():
     args = parse_arguments()
+    STAR_SELECTION_CONFIG["satlevel"] = args.satlevel if args.satlevel > 0 else None
+    STAR_SELECTION_CONFIG["max_stars_per_amp"] = (
+        args.max_stars_per_amp if args.max_stars_per_amp > 0 else None
+    )
+    if args.no_adaptive_threshold:
+        STAR_SELECTION_CONFIG["retry_thresholds"] = ()
     data_dir = Path(args.data_dir)
     outdir = Path(args.outdir)
     mask_dir = Path(args.mask_dir)
@@ -3332,6 +3488,11 @@ def main():
         },
         "fwhm_method": args.fwhm_method,
         "gmm_fwhm_method": args.gmm_fwhm_method,
+        "star_selection": {
+            "satlevel": STAR_SELECTION_CONFIG["satlevel"],
+            "max_stars_per_amp": STAR_SELECTION_CONFIG["max_stars_per_amp"],
+            "retry_thresholds": list(STAR_SELECTION_CONFIG["retry_thresholds"]),
+        },
         "bias_files": [_file_fingerprint(p) for p in bias_files_for_cache],
         "dark_files": [_file_fingerprint(p) for p in dark_files_for_cache],
         "flat_files_by_band": {

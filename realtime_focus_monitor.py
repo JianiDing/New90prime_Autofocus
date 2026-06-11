@@ -64,6 +64,10 @@ def build_pipeline_command(args: argparse.Namespace, sci_numbers: Sequence[int])
     base_cmd += ["--pixscale", str(args.pixscale)]
     base_cmd += ["--airmass-key", args.airmass_key]
     base_cmd += ["--threshold", str(args.threshold)]
+    base_cmd += ["--satlevel", str(args.satlevel)]
+    base_cmd += ["--max-stars-per-amp", str(args.max_stars_per_amp)]
+    if args.no_adaptive_threshold:
+        base_cmd.append("--no-adaptive-threshold")
     base_cmd += ["--fwhm-method", args.fwhm_method]
     base_cmd += ["--gmm-fwhm-method", args.gmm_fwhm_method]
     if args.amps:
@@ -762,6 +766,34 @@ def parse_args() -> argparse.Namespace:
         help="Plate scale in arcsec/pixel (default: 0.455 for Bok 90Prime)",
     )
     parser.add_argument("--threshold", type=float, default=25.0, help="SEP threshold")
+    parser.add_argument(
+        "--satlevel",
+        type=float,
+        default=55000.0,
+        help=(
+            "Detector saturation level in ADU passed to focus_pipeline.py; "
+            "sources peaking above it are excluded from star selection. "
+            "Set <= 0 to disable (default: 60000)."
+        ),
+    )
+    parser.add_argument(
+        "--max-stars-per-amp",
+        type=int,
+        default=100,
+        help=(
+            "Keep only the brightest N unsaturated sources per amplifier "
+            "before per-star FWHM measurement (CPU saving on rich fields). "
+            "Set 0 to disable (default: 100)."
+        ),
+    )
+    parser.add_argument(
+        "--no-adaptive-threshold",
+        action="store_true",
+        help=(
+            "Disable automatic re-extraction at lower SEP thresholds when "
+            "a frame yields few sources."
+        ),
+    )
     parser.add_argument(
         "--fwhm-method",
         choices=("direct", "moffat", "gaussian"),
